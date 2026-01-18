@@ -7,6 +7,42 @@ from fastapi import FastAPI, Response
 from pydantic import BaseModel, Field
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
+import json
+
+I2V_PREFIX = os.getenv("I2V_PREFIX", "anticip8:i2v:topk:")
+I2V_ALPHA = float(os.getenv("I2V_ALPHA", "0.7"))  # вес эмбеддингов
+I2V_TOPK = int(os.getenv("I2V_TOPK", "30"))       # сколько кандидатов брать из i2v
+
+def _i2v_key(service: str, path: str) -> str:
+    return f"{I2V_PREFIX}{service}::{path}"
+
+def _parse_node(node: str) -> Tuple[str, str]:
+    # "svc::/path"
+    svc, p = node.split("::", 1)
+    return svc, p
+
+def get_i2v_candidates(service: str, path: str) -> List[Tuple[str, str, float]]:
+    raw = r.get(_i2v_key(service, path))
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    out = []
+    for item in data[:I2V_TOPK]:
+        n = item.get("item")
+        cos = float(item.get("cos", 0.0))
+        if not n:
+            continue
+        try:
+            svc, p = _parse_node(n)
+        except Exception:
+            continue
+        out.append((svc, p, cos))
+    return out
+
+
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
@@ -136,22 +172,20 @@ def ingest_prefetch(edge: PrefetchEdge):
 def policy_next(service: str, path: str, user_key: str = "anon", limit: int = 3):
     p = norm_path(path)
 
-    # noise guard
     if p.startswith(NOISE_PREFIXES):
         return PolicyResp(next_paths=[], max_prefetch=0, max_prefetch_time_ms=0)
 
-    items: List[Tuple[str, str, float]] = []
+    # --- markov probabilities for current node ---
+    markov: dict[tuple[str, str], float] = {}
 
-    # 1) intra-service P(to|from) = count(from->to)/total(from)
     total1_raw = r.hget(_k_total(service), p)
     total1 = int(total1_raw) if total1_raw else 0
     if total1 > 0:
         trans = r.hgetall(_k_trans(service, p)) or {}
         for to_path, cnt in trans.items():
             c = int(cnt)
-            items.append((service, to_path, c / total1))
+            markov[(service, to_path)] = c / total1
 
-    # 2) cross-service P(dst|src) = count(src->dst)/total2(src)
     total2_raw = r.hget(_k_total_any(service), p)
     total2 = int(total2_raw) if total2_raw else 0
     if total2 > 0:
@@ -159,9 +193,43 @@ def policy_next(service: str, path: str, user_key: str = "anon", limit: int = 3)
         for packed, cnt in trans2.items():
             dst_svc, dst_path = _unpack(packed)
             c = int(cnt)
-            items.append((dst_svc, dst_path, c / total2))
+            markov[(dst_svc, dst_path)] = max(markov.get((dst_svc, dst_path), 0.0), c / total2)
 
-    # rank
+    # --- candidates from item2vec ---
+    cands = get_i2v_candidates(service, p)
+
+    # fallback: if no i2v, behave like old markov
+    if not cands:
+        items = [(s, pp, sc) for (s, pp), sc in markov.items()]
+        items.sort(key=lambda x: x[2], reverse=True)
+        top = items[: max(0, limit)]
+        return PolicyResp(
+            next_paths=[NextPath(service=s, path=pp, score=sc) for s, pp, sc in top],
+            max_prefetch=2,
+            max_prefetch_time_ms=80,
+        )
+
+    # --- hybrid scoring ---
+    scored = []
+    alpha = I2V_ALPHA
+    for svc, pp, cos in cands:
+        prob = markov.get((svc, pp), 0.0)
+        score = alpha * cos + (1.0 - alpha) * prob
+        scored.append((svc, pp, score))
+
+    # also add pure markov top edges that i2v didn't include (insurance)
+    # (иначе i2v может забыть редкий, но важный переход)
+    for (svc, pp), prob in markov.items():
+        scored.append((svc, pp, (1.0 - alpha) * prob))
+
+    # merge duplicates by max score
+    best: dict[tuple[str, str], float] = {}
+    for svc, pp, sc in scored:
+        key = (svc, pp)
+        if sc > best.get(key, -1e9):
+            best[key] = sc
+
+    items = [(svc, pp, sc) for (svc, pp), sc in best.items()]
     items.sort(key=lambda x: x[2], reverse=True)
     top = items[: max(0, limit)]
 

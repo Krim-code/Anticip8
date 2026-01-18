@@ -1,0 +1,178 @@
+### 0. HEALTH
+GET http://localhost:18000/health
+
+> {%
+  if (response.status !== 200) throw new Error("core health not OK");
+%}
+
+###
+
+### 1. BASELINE: first hit to options (expected 200)
+GET http://localhost:18002/order-options/15
+x-user: u_test
+
+> {%
+  if (response.status !== 200) throw new Error("options order-options baseline failed");
+%}
+
+###
+
+### 2. ORDERS
+GET http://localhost:18001/orders
+x-user: u_test
+
+> {%
+  if (response.status !== 200) throw new Error("orders list failed");
+%}
+
+###
+
+GET http://localhost:18001/orders/15
+x-user: u_test
+
+> {%
+  if (response.status !== 200) throw new Error("orders/{id} failed");
+%}
+
+###
+
+### 3. SEED: /orders -> /orders/15
+POST http://localhost:18000/ingest/event
+Content-Type: application/json
+
+{
+  "service": "orders-api",
+  "user_key": "u_test",
+  "from_path": "/orders",
+  "to_path": "/orders/15",
+  "status": 200,
+  "latency_ms": 12
+}
+
+> {%
+  if (response.status !== 200) throw new Error("seed event 1 failed");
+%}
+
+###
+
+### 4. SEED: /orders/15 -> /order-options/15
+POST http://localhost:18000/ingest/event
+Content-Type: application/json
+
+{
+  "service": "orders-api",
+  "user_key": "u_test",
+  "from_path": "/orders/15",
+  "to_path": "/order-options/15",
+  "status": 200,
+  "latency_ms": 48
+}
+
+> {%
+  if (response.status !== 200) throw new Error("seed event 2 failed");
+%}
+
+###
+
+### 5. SEED PREFETCH EDGE (optional if endpoint exists)
+POST http://localhost:18000/ingest/prefetch
+Content-Type: application/json
+
+{
+  "src_service": "orders-api",
+  "user_key": "u_test",
+  "src_path": "/orders/15",
+  "dst_service": "options-api",
+  "dst_path": "/order-options/15",
+  "status": 200,
+  "latency_ms": 20
+}
+
+> {%
+  if (response.status !== 200) throw new Error("seed prefetch edge failed");
+%}
+
+###
+
+### 6. POLICY RAW must have next_paths (after seeding)
+GET http://localhost:18000/policy/next?service=orders-api&path=/orders/15&user_key=u_test&limit=5
+
+> {%
+  if (response.status !== 200) throw new Error("policy raw failed");
+  const j = response.body;
+  if (!j.next_paths || j.next_paths.length === 0) throw new Error("policy raw returned empty next_paths");
+%}
+
+###
+
+### 7. TRIGGER PREFETCH by hitting /orders/15 again
+GET http://localhost:18001/orders/15
+x-user: u_test
+
+> {%
+  if (response.status !== 200) throw new Error("orders/{id} trigger failed");
+%}
+
+###
+
+### 8. “WAIT” (cheap calls)
+GET http://localhost:18002/contacts
+x-user: u_test
+
+> {%
+  if (response.status !== 200) throw new Error("contacts failed");
+%}
+
+###
+
+GET http://localhost:18002/contacts
+x-user: u_test
+
+> {%
+  if (response.status !== 200) throw new Error("contacts failed");
+%}
+
+###
+
+### 9. VERIFY options endpoint returns 200 (cache should be hot now)
+GET http://localhost:18002/order-options/15
+x-user: u_test
+
+> {%
+  if (response.status !== 200) throw new Error("options order-options verify failed");
+%}
+
+###
+
+### 10. METRICS: orders-api must have prefetch_total > 0 and histogram count > 0
+GET http://localhost:18001/metrics
+
+> {%
+  if (response.status !== 200) throw new Error("orders metrics failed");
+  const t = response.body;
+
+  // prefetch_total with label
+  const m1 = t.match(/anticip8_prefetch_total\{[^}]*service="orders-api"[^}]*\}\s+([0-9.]+)/);
+  if (!m1) throw new Error("prefetch_total{service=orders-api} not found");
+  if (parseFloat(m1[1]) <= 0) throw new Error("prefetch_total is 0");
+
+  // histogram count
+  const m2 = t.match(/anticip8_prefetch_latency_seconds_count\{[^}]*service="orders-api"[^}]*\}\s+([0-9.]+)/);
+  if (!m2) throw new Error("prefetch latency count not found");
+  if (parseFloat(m2[1]) <= 0) throw new Error("prefetch latency count is 0");
+%}
+
+###
+
+### 11. METRICS: options-api must have cache hits > 0 (namespace=options)
+GET http://localhost:18002/metrics
+
+> {%
+  if (response.status !== 200) throw new Error("options metrics failed");
+  const t = response.body;
+  const m = t.match(/anticip8_cache_hits_total\{[^}]*namespace="options"[^}]*\}\s+([0-9.]+)/);
+  if (!m) throw new Error("cache_hits_total{namespace=options} not found");
+  if (parseFloat(m[1]) <= 0) throw new Error("cache hits is 0");
+%}
+
+###
