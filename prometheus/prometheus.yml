@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: anticip8-core
+    static_configs:
+      - targets: ["anticip8-core:8000"]
+
+  - job_name: orders-api
+    static_configs:
+      - targets: ["orders-api:8000"]
+
+  - job_name: options-api
+    static_configs:
+      - targets: ["options-api:8000"]

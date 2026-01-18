@@ -1,0 +1,50 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  anticip8-core:
+    build: ./core
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on: [redis]
+    ports: ["18000:8000"]
+
+  orders-api:
+    build:
+      context: .
+      dockerfile: services/orders_api/Dockerfile
+    environment:
+      SERVICE_NAME: orders-api
+      ANTICIP8_CORE_URL: http://anticip8-core:8000
+      OPTIONS_BASE_URL: http://options-api:8000
+    depends_on: [anticip8-core]
+    ports: 
+      - "18001:8000"
+
+  options-api:
+    build:
+      context: .
+      dockerfile: services/options_api/Dockerfile
+    environment:
+      SERVICE_NAME: options-api
+      ANTICIP8_CORE_URL: http://anticip8-core:8000
+    depends_on: [anticip8-core]
+    ports: 
+      - "18002:8000"
+
+  locust:
+    build: ./locust
+    environment:
+      ORDERS_BASE_URL: http://orders-api:8000
+      OPTIONS_BASE_URL: http://options-api:8000
+    depends_on: [orders-api, options-api]
+    ports: ["18089:8089"]
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["19090:9090"]
+    depends_on: [anticip8-core, orders-api, options-api]
+
