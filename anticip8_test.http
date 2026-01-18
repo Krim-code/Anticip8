@@ -1,0 +1,118 @@
+### ========== 0. HEALTH ==========
+GET http://localhost:18000/health
+
+###
+
+### ========== 1. BASELINE: options-api slow call (first hit, should be slow-ish) ==========
+GET http://localhost:18002/order-options/15
+x-user: u_test
+
+###
+
+### ========== 2. ORDERS FLOW ==========
+GET http://localhost:18001/orders
+x-user: u_test
+
+###
+
+GET http://localhost:18001/orders/15
+x-user: u_test
+
+###
+
+### ========== 3. MANUAL TRAIN: /orders -> /orders/15 ==========
+POST http://localhost:18000/ingest/event
+Content-Type: application/json
+
+{
+  "service": "orders-api",
+  "user_key": "u_test",
+  "from_path": "/orders",
+  "to_path": "/orders/15",
+  "status": 200,
+  "latency_ms": 12
+}
+
+###
+
+### ========== 4. MANUAL TRAIN: /orders/15 -> /order-options/15 (same service graph for bootstrap) ==========
+POST http://localhost:18000/ingest/event
+Content-Type: application/json
+
+{
+  "service": "orders-api",
+  "user_key": "u_test",
+  "from_path": "/orders/15",
+  "to_path": "/order-options/15",
+  "status": 200,
+  "latency_ms": 48
+}
+
+###
+
+### ========== 5. OPTIONAL: if you have /ingest/prefetch, seed cross-service edge ==========
+POST http://localhost:18000/ingest/prefetch
+Content-Type: application/json
+
+{
+  "src_service": "orders-api",
+  "user_key": "u_test",
+  "src_path": "/orders/15",
+  "dst_service": "options-api",
+  "dst_path": "/order-options/15",
+  "status": 200,
+  "latency_ms": 20
+}
+
+###
+
+### ========== 6. POLICY RAW ==========
+GET http://localhost:18000/policy/next?service=orders-api&path=/orders/15&user_key=u_test&limit=5
+
+###
+
+### ========== 7. POLICY NORMALIZED ==========
+GET http://localhost:18000/policy/next?service=orders-api&path=/orders/{id}&user_key=u_test&limit=5
+
+###
+
+### ========== 8. TRIGGER PREFETCH (should cause background call to options-api) ==========
+GET http://localhost:18001/orders/15
+x-user: u_test
+
+###
+
+### ========== 9. GIVE PREFETCH A MOMENT (hit a cheap endpoint a few times) ==========
+GET http://localhost:18002/contacts
+x-user: u_test
+
+###
+
+GET http://localhost:18002/contacts
+x-user: u_test
+
+###
+
+GET http://localhost:18002/contacts
+x-user: u_test
+
+###
+
+### ========== 10. VERIFY CACHE FAST (subsequent hit should be fast in practice) ==========
+GET http://localhost:18002/order-options/15
+x-user: u_test
+
+###
+
+### ========== 11. METRICS DUMP: orders-api ==========
+GET http://localhost:18001/metrics
+
+###
+
+### ========== 12. METRICS DUMP: options-api ==========
+GET http://localhost:18002/metrics
+
+###
+
+### ========== 13. METRICS DUMP: core ==========
+GET http://localhost:18000/metrics

@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: "Anticip8"
+    orgId: 1
+    folder: "Anticip8"
+    type: file
+    disableDeletion: true
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards

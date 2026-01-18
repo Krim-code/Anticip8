@@ -1,0 +1,103 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Cache hit rate (options namespace)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(anticip8_cache_hits_total{namespace=\"options\"}[1m])) / clamp_min(sum(rate(anticip8_cache_hits_total{namespace=\"options\"}[1m])) + sum(rate(anticip8_cache_misses_total{namespace=\"options\"}[1m])), 1e-9)",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Cache hits / misses (options namespace)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(anticip8_cache_hits_total{namespace=\"options\"}[1m]))",
+          "refId": "A",
+          "legendFormat": "hits/s"
+        },
+        {
+          "expr": "sum(rate(anticip8_cache_misses_total{namespace=\"options\"}[1m]))",
+          "refId": "B",
+          "legendFormat": "misses/s"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Prefetch rate (by service)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum by (service) (rate(anticip8_prefetch_total[1m]))",
+          "refId": "A",
+          "legendFormat": "{{service}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Prefetch errors rate (by service, reason)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum by (service, reason) (rate(anticip8_prefetch_errors_total[1m]))",
+          "refId": "A",
+          "legendFormat": "{{service}}/{{reason}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Prefetch latency p95 (by service)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, service) (rate(anticip8_prefetch_latency_seconds_bucket[1m])))",
+          "refId": "A",
+          "legendFormat": "{{service}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Policy requests rate (by service)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum by (service) (rate(anticip8_policy_requests_total[1m]))",
+          "refId": "A",
+          "legendFormat": "{{service}}"
+        },
+        {
+          "expr": "sum by (service, reason) (rate(anticip8_policy_errors_total[1m]))",
+          "refId": "B",
+          "legendFormat": "err {{service}}/{{reason}}"
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": ["anticip8", "prefetch", "cache"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Anticip8 - Prefetch & Cache",
+  "uid": "anticip8-prefetch-cache",
+  "version": 1
+}
