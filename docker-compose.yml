@@ -33,6 +33,30 @@ services:
     ports: 
       - "18002:8000"
 
+  orders-api-baseline:
+    build:
+      context: .
+      dockerfile: services/orders_api_baseline/Dockerfile
+    environment:
+      SERVICE_NAME: orders-api-baseline
+      CACHE_MODE: IO_CACHE   # или NO_CACHE
+      REDIS_URL: redis://redis:6379/1
+    depends_on: [redis]
+    ports:
+      - "28001:8000"
+
+  options-api-baseline:
+    build:
+      context: .
+      dockerfile: services/options_api_baseline/Dockerfile
+    environment:
+      SERVICE_NAME: options-api-baseline
+      CACHE_MODE: IO_CACHE   # или NO_CACHE
+      REDIS_URL: redis://redis:6379/1
+    depends_on: [redis]
+    ports:
+      - "28002:8000"
+
   locust:
     build: ./locust
     environment:
@@ -40,6 +64,15 @@ services:
       OPTIONS_BASE_URL: http://options-api:8000
     depends_on: [orders-api, options-api]
     ports: ["18089:8089"]
+
+  locust-baseline:
+    build: ./locust
+    environment:
+      ORDERS_BASE_URL: http://orders-api-baseline:8000
+      OPTIONS_BASE_URL: http://options-api-baseline:8000
+    depends_on: [orders-api-baseline, options-api-baseline]
+    ports:
+      - "18090:8089"
 
   prometheus:
     image: prom/prometheus:v2.52.0

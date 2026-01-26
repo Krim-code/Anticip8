@@ -35,6 +35,7 @@
         }
       ]
     },
+
     {
       "type": "timeseries",
       "title": "Prefetch rate (by service)",
@@ -59,6 +60,7 @@
         }
       ]
     },
+
     {
       "type": "timeseries",
       "title": "Prefetch latency p95 (by service)",
@@ -73,8 +75,21 @@
     },
     {
       "type": "timeseries",
-      "title": "Policy requests rate (by service)",
+      "title": "Prefetch latency p95 (overall)",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(anticip8_prefetch_latency_seconds_bucket[1m])))",
+          "refId": "A",
+          "legendFormat": "p95 overall"
+        }
+      ]
+    },
+
+    {
+      "type": "timeseries",
+      "title": "Policy requests rate (by service)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
       "targets": [
         {
           "expr": "sum by (service) (rate(anticip8_policy_requests_total[1m]))",
@@ -87,6 +102,98 @@
           "legendFormat": "err {{service}}/{{reason}}"
         }
       ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Policy error ratio (errors/requests) by service",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "targets": [
+        {
+          "expr": "sum by (service) (rate(anticip8_policy_errors_total[1m])) / clamp_min(sum by (service) (rate(anticip8_policy_requests_total[1m])), 1e-9)",
+          "refId": "A",
+          "legendFormat": "{{service}}"
+        }
+      ]
+    },
+
+    {
+      "type": "timeseries",
+      "title": "Policy latency p95 (by service) [ADD policy_latency histogram]",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, service) (rate(anticip8_policy_latency_seconds_bucket[1m])))",
+          "refId": "A",
+          "legendFormat": "{{service}}"
+        }
+      ],
+      "description": "Появится после добавления anticip8_policy_latency_seconds histogram в SDK."
+    },
+    {
+      "type": "timeseries",
+      "title": "Policy latency p95 (overall) [ADD policy_latency histogram]",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(anticip8_policy_latency_seconds_bucket[1m])))",
+          "refId": "A",
+          "legendFormat": "p95 overall"
+        }
+      ]
+    },
+
+    {
+      "type": "timeseries",
+      "title": "Prefetch dedup skips rate (by service) [ADD prefetch_dedup_skips_total]",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "targets": [
+        {
+          "expr": "sum by (service) (rate(anticip8_prefetch_dedup_skips_total[1m]))",
+          "refId": "A",
+          "legendFormat": "{{service}}"
+        }
+      ],
+      "description": "Если тут много — ты долбишь одно и то же; дедуп спасает, но точность/польза может быть мусорной."
+    },
+    {
+      "type": "timeseries",
+      "title": "Prefetch deadline skips rate (by service) [ADD prefetch_deadline_skips_total]",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "targets": [
+        {
+          "expr": "sum by (service) (rate(anticip8_prefetch_deadline_skips_total[1m]))",
+          "refId": "A",
+          "legendFormat": "{{service}}"
+        }
+      ],
+      "description": "Если растёт — budget слишком жёсткий или policy слишком медленный."
+    },
+
+    {
+      "type": "timeseries",
+      "title": "Prefetch budget overruns rate (by service) [ADD prefetch_budget_overrun_total]",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "targets": [
+        {
+          "expr": "sum by (service) (rate(anticip8_prefetch_budget_overrun_total[1m]))",
+          "refId": "A",
+          "legendFormat": "{{service}}"
+        }
+      ],
+      "description": "Сколько батчей префетча умерло по deadline."
+    },
+    {
+      "type": "timeseries",
+      "title": "Prefetch-to-policy amplification (prefetch/policy) by service",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "targets": [
+        {
+          "expr": "sum by (service) (rate(anticip8_prefetch_total[1m])) / clamp_min(sum by (service) (rate(anticip8_policy_requests_total[1m])), 1e-9)",
+          "refId": "A",
+          "legendFormat": "{{service}}"
+        }
+      ],
+      "description": "Сколько префетчей в среднем рождается на 1 policy. Если > max_prefetch — у тебя хвосты/перезапуски/дубли."
     }
   ],
   "refresh": "5s",
@@ -99,5 +206,5 @@
   "timezone": "browser",
   "title": "Anticip8 - Prefetch & Cache",
   "uid": "anticip8-prefetch-cache",
-  "version": 1
+  "version": 3
 }

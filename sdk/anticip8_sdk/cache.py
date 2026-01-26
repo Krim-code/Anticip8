@@ -93,15 +93,10 @@ def cache_response(
 
             cache_misses.labels(service=service, namespace=namespace).inc()
 
-
-            hit = cache.get(key)
-            if hit is not None:
-                return json.loads(hit)
-
             data = await fn(*args, **kwargs) if is_async else fn(*args, **kwargs)
-
             cache.setex(key, ttl, _stable_json(data))
             return data
+
 
         # ВОТ ЭТО — главное: говорим FastAPI “сигнатура как у оригинала”
         wrapper.__signature__ = sig
