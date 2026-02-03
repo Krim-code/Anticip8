@@ -7,6 +7,18 @@ services:
     build: ./core
     environment:
       REDIS_URL: redis://redis:6379/0
+      # Battle-tuned defaults: avoid empty policies + make prefetch actually happen.
+      MIN_PROB: "0.001"
+      MARKOV_SMOOTH: "1.0"
+      MAX_PREFETCH: "3"
+      PREFETCH_BUDGET_MS: "250"
+
+      SERVICE_BIAS: "orders-api=1.0,options-api=0.7"
+      CROSS_SERVICE_PENALTY: "0.85"
+      INTRA_SERVICE_BOOST: "0.10"
+      TIER1_INTRA_FIRST: "1"
+      POLICY_DENY_REGEX: "/cancel|/payment"
+
     depends_on: [redis]
     ports: ["18000:8000"]
 
@@ -18,6 +30,18 @@ services:
       SERVICE_NAME: orders-api
       ANTICIP8_CORE_URL: http://anticip8-core:8000
       OPTIONS_BASE_URL: http://options-api:8000
+      ANTICIP8_INTENT_TTL_SEC: 120
+      ANTICIP8_PREFETCH_MARK_TTL_SEC: 180
+      ANTICIP8_PREFETCH_MAX_BATCH_INFLIGHT: "1"
+      ANTICIP8_PREFETCH_PER_REQUEST_TIMEOUT_SEC: "0.35"
+      ANTICIP8_MIN_PREFETCH_WINDOW_SEC: "0.06"
+      ANTICIP8_PREFETCH_MAX_CONCURRENCY: "2"
+      ANTICIP8_QUERY_MODE: ignore
+      ANTICIP8_LOG_REAL: 1
+      ANTICIP8_LOG_PREFETCH: 1
+      ANTICIP8_LOG_HITMISS: 1
+      # ANTICIP8_LOG_ONLY_USER: u254
+      ANTICIP8_LOG_SAMPLE: 1
     depends_on: [anticip8-core]
     ports: 
       - "18001:8000"
@@ -28,7 +52,19 @@ services:
       dockerfile: services/options_api/Dockerfile
     environment:
       SERVICE_NAME: options-api
+      ANTICIP8_INTENT_TTL_SEC: 120
+      ANTICIP8_PREFETCH_MARK_TTL_SEC: 0
       ANTICIP8_CORE_URL: http://anticip8-core:8000
+      ANTICIP8_PREFETCH_MAX_BATCH_INFLIGHT: "1"
+      ANTICIP8_PREFETCH_PER_REQUEST_TIMEOUT_SEC: "0.35"
+      ANTICIP8_MIN_PREFETCH_WINDOW_SEC: "0.06"
+      ANTICIP8_PREFETCH_MAX_CONCURRENCY: "2"
+      ANTICIP8_QUERY_MODE: ignore
+      ANTICIP8_LOG_REAL: 1
+      ANTICIP8_LOG_PREFETCH: 1
+      ANTICIP8_LOG_HITMISS: 1
+      # ANTICIP8_LOG_ONLY_USER: u254
+      ANTICIP8_LOG_SAMPLE: 1
     depends_on: [anticip8-core]
     ports: 
       - "18002:8000"

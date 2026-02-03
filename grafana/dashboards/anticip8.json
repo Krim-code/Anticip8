@@ -35,7 +35,6 @@
         }
       ]
     },
-
     {
       "type": "timeseries",
       "title": "Prefetch rate (by service)",
@@ -60,7 +59,6 @@
         }
       ]
     },
-
     {
       "type": "timeseries",
       "title": "Prefetch latency p95 (by service)",
@@ -85,7 +83,6 @@
         }
       ]
     },
-
     {
       "type": "timeseries",
       "title": "Policy requests rate (by service)",
@@ -115,7 +112,6 @@
         }
       ]
     },
-
     {
       "type": "timeseries",
       "title": "Policy latency p95 (by service) [ADD policy_latency histogram]",
@@ -141,7 +137,6 @@
         }
       ]
     },
-
     {
       "type": "timeseries",
       "title": "Prefetch dedup skips rate (by service) [ADD prefetch_dedup_skips_total]",
@@ -168,7 +163,6 @@
       ],
       "description": "Если растёт — budget слишком жёсткий или policy слишком медленный."
     },
-
     {
       "type": "timeseries",
       "title": "Prefetch budget overruns rate (by service) [ADD prefetch_budget_overrun_total]",
@@ -194,6 +188,47 @@
         }
       ],
       "description": "Сколько префетчей в среднем рождается на 1 policy. Если > max_prefetch — у тебя хвосты/перезапуски/дубли."
+    },
+
+
+    {
+      "type": "timeseries",
+      "title": "Intent coverage (intent_seen / (seen+missing))",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 56 },
+      "targets": [
+        {
+          "expr": "sum(rate(anticip8_intent_seen_total[1m])) / clamp_min(sum(rate(anticip8_intent_seen_total[1m])) + sum(rate(anticip8_intent_missing_total[1m])), 1e-9)",
+          "refId": "A",
+          "legendFormat": "overall"
+        }
+      ],
+      "description": "Насколько часто реальный запрос приходит с intent (policy угадал/поставил intent заранее)."
+    },
+    {
+      "type": "timeseries",
+      "title": "Prefetch readiness given intent (mark_ready / (ready+not_ready))",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 56 },
+      "targets": [
+        {
+          "expr": "sum(rate(anticip8_prefetch_mark_ready_total[1m])) / clamp_min(sum(rate(anticip8_prefetch_mark_ready_total[1m])) + sum(rate(anticip8_prefetch_mark_not_ready_total[1m])), 1e-9)",
+          "refId": "A",
+          "legendFormat": "overall"
+        }
+      ],
+      "description": "Если intent был, успел ли префетч поставить mark к моменту реального запроса."
+    },
+    {
+      "type": "timeseries",
+      "title": "Race grace ratio (grace_hits / (hits+misses))",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 64 },
+      "targets": [
+        {
+          "expr": "sum(rate(anticip8_race_grace_hits_total[1m])) / clamp_min(sum(rate(anticip8_race_grace_hits_total[1m])) + sum(rate(anticip8_race_grace_misses_total[1m])), 1e-9)",
+          "refId": "A",
+          "legendFormat": "overall"
+        }
+      ],
+      "description": "Доля случаев, когда mark появился через маленькую задержку (race), а не потому что префетч реально не сработал."
     }
   ],
   "refresh": "5s",

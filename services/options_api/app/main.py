@@ -17,6 +17,8 @@ app.add_middleware(
         "options-api": "http://options-api:8000",
     },
     prefetch_enabled=True,
+    # Keep this low: more concurrency usually increases deadline skips without improving hit-rate.
+    max_prefetch_concurrency=2,
 )
 # --- helpers ---
 def _sleep(ms_min: int, ms_max: int):

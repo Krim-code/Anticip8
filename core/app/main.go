@@ -39,18 +39,33 @@ var (
 	allowPrefetchAttemptsInPolicy = getenvBool("ALLOW_PREFETCH_ATTEMPTS_IN_POLICY", false) || getenvBool("ALLOW_PREFETCH_ATTEMPTS", false)
 	prefetchAttemptWeight         = getenvFloat("PREFETCH_ATTEMPT_WEIGHT", 0.15)
 
-	defaultMaxPrefetch      = getenvInt("MAX_PREFETCH", 2)
-	defaultPrefetchBudgetMS = getenvInt("PREFETCH_BUDGET_MS", 120)
+	defaultMaxPrefetch      = getenvInt("MAX_PREFETCH", 4)
+	defaultPrefetchBudgetMS = getenvInt("PREFETCH_BUDGET_MS", 320)
 
 	markovSmooth  = getenvFloat("MARKOV_SMOOTH", 0.5)
 	minProb       = getenvFloat("MIN_PROB", 0.01)
 	dropSelfLoops = getenvBool("DROP_SELF_LOOPS", true)
 
+	// ===== Effectiveness tuning =====
+	// Per-service weights, e.g. "orders-api=1.0,options-api=0.7"
+	serviceBiasRaw = getenv("SERVICE_BIAS", "")
+	// Penalize cross-service targets (often more expensive, causes timeouts)
+	crossPenalty = getenvFloat("CROSS_SERVICE_PENALTY", 0.85)
+	// Small additive boost for intra targets so they win close ties
+	intraBoost = getenvFloat("INTRA_SERVICE_BOOST", 0.10)
+
+	// Tier-1 intra-first: ensure at least one intra candidate in output if exists
+	tier1IntraFirst = getenvBool("TIER1_INTRA_FIRST", true)
+
+	// Denylist in POLICY (filter early, reduces garbage work)
+	denyRegexRaw = getenv("POLICY_DENY_REGEX", "")
+	denyRe       *regexp.Regexp
+
 	// =========================
 	// Path normalization
 	// =========================
-	reUUID = regexp.MustCompile(`/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}(/|$)`)
-    reInt  = regexp.MustCompile(`/\d+(/|$)`)
+	reUUID      = regexp.MustCompile(`/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}(/|$)`)
+	reInt       = regexp.MustCompile(`/\d+(/|$)`)
 	reUUIDToken = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}`)
 	reIntToken  = regexp.MustCompile(`(?:^|/)\d+(?:/|$)`)
 )
@@ -109,6 +124,21 @@ func main() {
 		log.Fatalf("bad REDIS_URL: %v", err)
 	}
 	rdb = redis.NewClient(opt)
+
+	// deny regex init
+	if strings.TrimSpace(denyRegexRaw) != "" {
+		if re, err := regexp.Compile(denyRegexRaw); err == nil {
+			denyRe = re
+			log.Printf("policy deny regex enabled: %s", denyRegexRaw)
+		} else {
+			log.Printf("policy deny regex invalid: %s err=%v", denyRegexRaw, err)
+		}
+	}
+
+	biasMap := parseBias(serviceBiasRaw)
+	if len(biasMap) > 0 {
+		log.Printf("service bias enabled: %v", biasMap)
+	}
 
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -205,243 +235,270 @@ func main() {
 	// Policy
 	// -------------------------
 	r.GET("/policy/next", func(c *gin.Context) {
-	service := c.Query("service")
-	rawPath := c.Query("path")
+		service := c.Query("service")
+		rawPath := c.Query("path")
 
-	limit := getenvInt("POLICY_LIMIT_DEFAULT", 3)
-	if q := c.Query("limit"); q != "" {
-		if v, err := strconv.Atoi(q); err == nil {
-			limit = v
+		limit := getenvInt("POLICY_LIMIT_DEFAULT", 3)
+		if q := c.Query("limit"); q != "" {
+			if v, err := strconv.Atoi(q); err == nil {
+				limit = v
+			}
 		}
-	}
-	if limit < 0 {
-		limit = 0
-	}
-	if service == "" || rawPath == "" {
-		c.JSON(400, gin.H{"error": "service and path required"})
-		return
-	}
-
-	// normalized node key
-	p := normPath(rawPath)
-	if isNoise(p) {
-		c.JSON(200, PolicyResp{NextPaths: []NextPath{}, MaxPrefetch: 0, MaxPrefetchTimeMS: 0})
-		return
-	}
-
-	// detect tokens from *source* path
-	srcHasID := reIntToken.MatchString(rawPath) || strings.Contains(p, "{id}")
-	srcHasUUID := reUUIDToken.MatchString(rawPath) || strings.Contains(p, "{uuid}")
-
-	// collected probs for candidates: packed "svc|path" -> prob
-	markov := make(map[string]float64)
-
-	// helper: apply (smoothed) multinomial counts into markov map
-	applyCounts := func(counts map[string]int64) {
-		var total int64
-		for _, v := range counts {
-			total += v
+		if limit < 0 {
+			limit = 0
 		}
-		if total <= 0 {
+		if service == "" || rawPath == "" {
+			c.JSON(400, gin.H{"error": "service and path required"})
 			return
 		}
-		k := float64(len(counts))
-		den := float64(total)
-		if markovSmooth > 0 && k > 0 {
-			den += markovSmooth * k
-		}
-		for key, cn := range counts {
-			num := float64(cn)
-			if markovSmooth > 0 {
-				num += markovSmooth
-			}
-			prob := num / den
-			if prob < minProb {
-				continue
-			}
-			if cur, ok := markov[key]; !ok || prob > cur {
-				markov[key] = prob
-			}
-		}
-	}
 
-	// 1) intra-service
-	if trans, err := rdb.HGetAll(ctx, kTrans(service, p)).Result(); err == nil && len(trans) > 0 {
-		counts := make(map[string]int64)
-		for to, cntStr := range trans {
-			cn, err := strconv.ParseInt(cntStr, 10, 64)
-			if err != nil || cn <= 0 {
-				continue
-			}
-			if dropSelfLoops && to == p {
-				continue
-			}
-			counts[pack(service, to)] = cn
+		// normalized node key
+		p := normPath(rawPath)
+		if isNoise(p) {
+			c.JSON(200, PolicyResp{NextPaths: []NextPath{}, MaxPrefetch: 0, MaxPrefetchTimeMS: 0})
+			return
 		}
-		if len(counts) > 0 {
-			applyCounts(counts)
-		}
-	}
 
-	// 2) cross-service REAL
-	if trans2, err := rdb.HGetAll(ctx, kTransAny(service, p)).Result(); err == nil && len(trans2) > 0 {
-		counts := make(map[string]int64)
-		for packed, cntStr := range trans2 {
-			cn, err := strconv.ParseInt(cntStr, 10, 64)
-			if err != nil || cn <= 0 {
-				continue
-			}
-			if dropSelfLoops && packed == pack(service, p) {
-				continue
-			}
-			counts[packed] = cn
-		}
-		if len(counts) > 0 {
-			applyCounts(counts)
-		}
-	}
+		// detect tokens from *source* path
+		srcHasID := reIntToken.MatchString(rawPath) || strings.Contains(p, "{id}")
+		srcHasUUID := reUUIDToken.MatchString(rawPath) || strings.Contains(p, "{uuid}")
 
-	// 3) OPTIONAL: prefetch attempts as weak hint
-	if allowPrefetchAttemptsInPolicy {
-		totalpStr, err := rdb.HGet(ctx, kTotalPrefetch(service), p).Result()
-		if err == nil && totalpStr != "" {
-			if totalp, err2 := strconv.ParseInt(totalpStr, 10, 64); err2 == nil && totalp > 0 {
-				if trans2p, err3 := rdb.HGetAll(ctx, kTransPrefetch(service, p)).Result(); err3 == nil && len(trans2p) > 0 {
-					for packed, cntStr := range trans2p {
-						cn, err := strconv.ParseInt(cntStr, 10, 64)
-						if err != nil || cn <= 0 {
-							continue
-						}
-						prob := (float64(cn) / float64(totalp)) * prefetchAttemptWeight
-						if prob < minProb {
-							continue
-						}
-						if cur, ok := markov[packed]; !ok || prob > cur {
-							markov[packed] = prob
+		// collected probs for candidates: packed "svc|path" -> prob
+		markov := make(map[string]float64)
+
+		// helper: apply (smoothed) multinomial counts into markov map
+		applyCounts := func(counts map[string]int64) {
+			var total int64
+			for _, v := range counts {
+				total += v
+			}
+			if total <= 0 {
+				return
+			}
+			k := float64(len(counts))
+			den := float64(total)
+			if markovSmooth > 0 && k > 0 {
+				den += markovSmooth * k
+			}
+			for key, cn := range counts {
+				num := float64(cn)
+				if markovSmooth > 0 {
+					num += markovSmooth
+				}
+				prob := num / den
+				if prob < minProb {
+					continue
+				}
+				if cur, ok := markov[key]; !ok || prob > cur {
+					markov[key] = prob
+				}
+			}
+		}
+
+		// 1) intra-service
+		if trans, err := rdb.HGetAll(ctx, kTrans(service, p)).Result(); err == nil && len(trans) > 0 {
+			counts := make(map[string]int64)
+			for to, cntStr := range trans {
+				cn, err := strconv.ParseInt(cntStr, 10, 64)
+				if err != nil || cn <= 0 {
+					continue
+				}
+				to = normPath(to)
+				if isNoise(to) {
+					continue
+				}
+				if dropSelfLoops && to == p {
+					continue
+				}
+				counts[pack(service, to)] = cn
+			}
+			if len(counts) > 0 {
+				applyCounts(counts)
+			}
+		}
+
+		// 2) cross-service REAL
+		if trans2, err := rdb.HGetAll(ctx, kTransAny(service, p)).Result(); err == nil && len(trans2) > 0 {
+			counts := make(map[string]int64)
+			for packed, cntStr := range trans2 {
+				cn, err := strconv.ParseInt(cntStr, 10, 64)
+				if err != nil || cn <= 0 {
+					continue
+				}
+				if dropSelfLoops && packed == pack(service, p) {
+					continue
+				}
+				// normalize stored packed dst path too
+				svc2, pp2 := unpack(packed)
+				pp2 = normPath(pp2)
+				if isNoise(pp2) {
+					continue
+				}
+				counts[pack(svc2, pp2)] = cn
+			}
+			if len(counts) > 0 {
+				applyCounts(counts)
+			}
+		}
+
+		// 3) OPTIONAL: prefetch attempts as weak hint
+		if allowPrefetchAttemptsInPolicy {
+			totalpStr, err := rdb.HGet(ctx, kTotalPrefetch(service), p).Result()
+			if err == nil && totalpStr != "" {
+				if totalp, err2 := strconv.ParseInt(totalpStr, 10, 64); err2 == nil && totalp > 0 {
+					if trans2p, err3 := rdb.HGetAll(ctx, kTransPrefetch(service, p)).Result(); err3 == nil && len(trans2p) > 0 {
+						for packed, cntStr := range trans2p {
+							cn, err := strconv.ParseInt(cntStr, 10, 64)
+							if err != nil || cn <= 0 {
+								continue
+							}
+							svc2, pp2 := unpack(packed)
+							pp2 = normPath(pp2)
+							if isNoise(pp2) {
+								continue
+							}
+							prob := (float64(cn) / float64(totalp)) * prefetchAttemptWeight
+							if prob < minProb {
+								continue
+							}
+							key := pack(svc2, pp2)
+							if cur, ok := markov[key]; !ok || prob > cur {
+								markov[key] = prob
+							}
 						}
 					}
 				}
 			}
 		}
-	}
 
-	// 4) i2v (once)
-	cands := getI2VCandidates(service, p)
+		// 4) i2v (once)
+		cands := getI2VCandidates(service, p)
 
-	// function: filter candidate list by source-token compatibility
-	filterOut := func(items []NextPath) []NextPath {
-		if len(items) == 0 {
-			return items
+		// function: filter candidate list by source-token compatibility + denylist
+		filterOut := func(items []NextPath) []NextPath {
+			if len(items) == 0 {
+				return items
+			}
+			out := items[:0]
+			for _, it := range items {
+				pp := it.Path
+
+				// policy denylist (filter early)
+				if denyRe != nil && denyRe.MatchString(pp) {
+					continue
+				}
+
+				if strings.Contains(pp, "{id}") && !srcHasID {
+					continue
+				}
+				if strings.Contains(pp, "{uuid}") && !srcHasUUID {
+					continue
+				}
+				out = append(out, it)
+			}
+			return out
 		}
-		out := items[:0]
-		for _, it := range items {
-			pp := it.Path
-			if strings.Contains(pp, "{id}") && !srcHasID {
+
+		// Fallback: pure markov
+		if len(cands) == 0 {
+			items := make([]NextPath, 0, len(markov))
+			for packed, prob := range markov {
+				svc, pp := unpack(packed)
+				if math.IsNaN(prob) || math.IsInf(prob, 0) {
+					continue
+				}
+				items = append(items, NextPath{Service: svc, Path: pp, Score: prob})
+			}
+			sort.Slice(items, func(i, j int) bool { return items[i].Score > items[j].Score })
+
+			items = filterOut(items)
+
+			if len(items) > limit {
+				items = items[:limit]
+			}
+			if len(items) == 0 {
+				c.JSON(200, PolicyResp{NextPaths: []NextPath{}, MaxPrefetch: 0, MaxPrefetchTimeMS: 0})
+				return
+			}
+
+			// Apply bias/penalty/boost even for fallback
+			items = applyEffectivenessTuning(items, service, biasMap)
+
+			c.JSON(200, PolicyResp{
+				NextPaths:         items,
+				MaxPrefetch:       defaultMaxPrefetch,
+				MaxPrefetchTimeMS: defaultPrefetchBudgetMS,
+			})
+			return
+		}
+
+		// Hybrid scoring
+		best := map[string]float64{} // packed -> score
+		alpha := i2vAlpha
+
+		// score i2v cands
+		for _, it := range cands {
+			key := pack(it.Service, it.Path)
+			if dropSelfLoops && key == pack(service, p) {
 				continue
 			}
-			if strings.Contains(pp, "{uuid}") && !srcHasUUID {
+			prob := markov[key]
+			score := alpha*it.Score + (1.0-alpha)*prob
+			if cur, ok := best[key]; !ok || score > cur {
+				best[key] = score
+			}
+		}
+
+		// insurance: top markov edges
+		type kv struct {
+			Key  string
+			Prob float64
+		}
+		mItems := make([]kv, 0, len(markov))
+		for k, v := range markov {
+			mItems = append(mItems, kv{Key: k, Prob: v})
+		}
+		sort.Slice(mItems, func(i, j int) bool { return mItems[i].Prob > mItems[j].Prob })
+
+		insCap := maxInt(5, limit*3)
+		if len(mItems) > insCap {
+			mItems = mItems[:insCap]
+		}
+		for _, kv := range mItems {
+			score := (1.0 - alpha) * kv.Prob
+			if cur, ok := best[kv.Key]; !ok || score > cur {
+				best[kv.Key] = score
+			}
+		}
+
+		out := make([]NextPath, 0, len(best))
+		for packed, score := range best {
+			if math.IsNaN(score) || math.IsInf(score, 0) {
 				continue
 			}
-			out = append(out, it)
-		}
-		return out
-	}
-
-	// Fallback: pure markov
-	if len(cands) == 0 {
-		items := make([]NextPath, 0, len(markov))
-		for packed, prob := range markov {
 			svc, pp := unpack(packed)
-			if math.IsNaN(prob) || math.IsInf(prob, 0) {
-				continue
-			}
-			items = append(items, NextPath{Service: svc, Path: pp, Score: prob})
+			out = append(out, NextPath{Service: svc, Path: pp, Score: score})
 		}
-		sort.Slice(items, func(i, j int) bool { return items[i].Score > items[j].Score })
+		sort.Slice(out, func(i, j int) bool { return out[i].Score > out[j].Score })
 
-		items = filterOut(items)
+		out = filterOut(out)
+		out = applyEffectivenessTuning(out, service, biasMap)
 
-		if len(items) > limit {
-			items = items[:limit]
+		if len(out) > limit {
+			out = out[:limit]
 		}
-		if len(items) == 0 {
+		if len(out) == 0 {
 			c.JSON(200, PolicyResp{NextPaths: []NextPath{}, MaxPrefetch: 0, MaxPrefetchTimeMS: 0})
 			return
 		}
 
 		c.JSON(200, PolicyResp{
-			NextPaths:         items,
+			NextPaths:         out,
 			MaxPrefetch:       defaultMaxPrefetch,
 			MaxPrefetchTimeMS: defaultPrefetchBudgetMS,
 		})
-		return
-	}
-
-	// Hybrid scoring
-	best := map[string]float64{} // packed -> score
-	alpha := i2vAlpha
-
-	// score i2v cands
-	for _, it := range cands {
-		key := pack(it.Service, it.Path)
-		if dropSelfLoops && key == pack(service, p) {
-			continue
-		}
-		prob := markov[key]
-		score := alpha*it.Score + (1.0-alpha)*prob
-		if cur, ok := best[key]; !ok || score > cur {
-			best[key] = score
-		}
-	}
-
-	// insurance: top markov edges
-	type kv struct {
-		Key  string
-		Prob float64
-	}
-	mItems := make([]kv, 0, len(markov))
-	for k, v := range markov {
-		mItems = append(mItems, kv{Key: k, Prob: v})
-	}
-	sort.Slice(mItems, func(i, j int) bool { return mItems[i].Prob > mItems[j].Prob })
-
-	insCap := maxInt(5, limit*3)
-	if len(mItems) > insCap {
-		mItems = mItems[:insCap]
-	}
-	for _, kv := range mItems {
-		score := (1.0 - alpha) * kv.Prob
-		if cur, ok := best[kv.Key]; !ok || score > cur {
-			best[kv.Key] = score
-		}
-	}
-
-	out := make([]NextPath, 0, len(best))
-	for packed, score := range best {
-		if math.IsNaN(score) || math.IsInf(score, 0) {
-			continue
-		}
-		svc, pp := unpack(packed)
-		out = append(out, NextPath{Service: svc, Path: pp, Score: score})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Score > out[j].Score })
-
-	out = filterOut(out)
-
-	if len(out) > limit {
-		out = out[:limit]
-	}
-	if len(out) == 0 {
-		c.JSON(200, PolicyResp{NextPaths: []NextPath{}, MaxPrefetch: 0, MaxPrefetchTimeMS: 0})
-		return
-	}
-
-	c.JSON(200, PolicyResp{
-		NextPaths:         out,
-		MaxPrefetch:       defaultMaxPrefetch,
-		MaxPrefetchTimeMS: defaultPrefetchBudgetMS,
 	})
-})
+
 	// -------------------------
 	// Debug + misc
 	// -------------------------
@@ -464,13 +521,18 @@ func main() {
 		topTrans := topNHash(trans, 10)
 		topTrans2 := topNHash(trans2, 10)
 
+		i2v := getI2VCandidates(service, p)
+		if len(i2v) > 10 {
+			i2v = i2v[:10]
+		}
+
 		c.JSON(200, gin.H{
-			"p":          p,
-			"trans_keys": len(trans),
+			"p":           p,
+			"trans_keys":  len(trans),
 			"trans2_keys": len(trans2),
-			"top_trans":  topTrans,
-			"top_trans2": topTrans2,
-			"i2v":        getI2VCandidates(service, p)[:minInt(10, len(getI2VCandidates(service, p)))],
+			"top_trans":   topTrans,
+			"top_trans2":  topTrans2,
+			"i2v":         i2v,
 		})
 	})
 
@@ -485,7 +547,55 @@ func main() {
 	}
 
 	log.Printf("core-go up on :%s redis=%s", port, redisURL)
+	log.Printf("tuning: crossPenalty=%.3f intraBoost=%.3f tier1IntraFirst=%v denyRegex=%q", crossPenalty, intraBoost, tier1IntraFirst, denyRegexRaw)
 	log.Fatal(srv.ListenAndServe())
+}
+
+// =========================
+// Effectiveness helpers
+// =========================
+
+func applyEffectivenessTuning(items []NextPath, srcService string, biasMap map[string]float64) []NextPath {
+	if len(items) == 0 {
+		return items
+	}
+
+	// apply bias/penalty/boost
+	for i := range items {
+		svc := items[i].Service
+		score := items[i].Score
+
+		score *= biasFor(biasMap, svc)
+		if svc != srcService {
+			score *= crossPenalty
+		} else {
+			score += intraBoost
+		}
+
+		items[i].Score = score
+	}
+
+	sort.Slice(items, func(i, j int) bool { return items[i].Score > items[j].Score })
+
+	// Tier-1 intra-first: ensure at least 1 intra if exists
+	if tier1IntraFirst && len(items) > 1 {
+		if items[0].Service != srcService {
+			// find first intra
+			idx := -1
+			for i := 1; i < len(items); i++ {
+				if items[i].Service == srcService {
+					idx = i
+					break
+				}
+			}
+			if idx != -1 {
+				// swap into top-0
+				items[0], items[idx] = items[idx], items[0]
+			}
+		}
+	}
+
+	return items
 }
 
 // =========================
@@ -503,7 +613,7 @@ func normPath(p string) string {
 		p = strings.TrimSuffix(p, "/")
 	}
 	p = reUUID.ReplaceAllString(p, "/{uuid}$1")
-    p = reInt.ReplaceAllString(p, "/{id}$1")
+	p = reInt.ReplaceAllString(p, "/{id}$1")
 	return p
 }
 
@@ -545,6 +655,10 @@ func getI2VCandidates(service, path string) []NextPath {
 		}
 		svc, p, ok := parseNode(n)
 		if !ok {
+			continue
+		}
+		p = normPath(p)
+		if isNoise(p) {
 			continue
 		}
 		out = append(out, NextPath{Service: svc, Path: p, Score: data[i].Cos})
@@ -648,4 +762,44 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// service bias helpers
+func parseBias(s string) map[string]float64 {
+	out := map[string]float64{}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return out
+	}
+	parts := strings.Split(s, ",")
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		kv := strings.SplitN(p, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		svc := strings.TrimSpace(kv[0])
+		if svc == "" {
+			continue
+		}
+		v, err := strconv.ParseFloat(strings.TrimSpace(kv[1]), 64)
+		if err != nil {
+			continue
+		}
+		out[svc] = v
+	}
+	return out
+}
+
+func biasFor(m map[string]float64, svc string) float64 {
+	if m == nil {
+		return 1.0
+	}
+	if v, ok := m[svc]; ok {
+		return v
+	}
+	return 1.0
 }
