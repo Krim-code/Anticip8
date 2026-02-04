@@ -3,9 +3,10 @@ import json
 import hashlib
 import inspect
 from functools import wraps
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Union, Awaitable
 
-import redis
+import anyio
+from redis.asyncio import Redis
 
 from .metrics import cache_hits, cache_misses
 
@@ -21,6 +22,9 @@ def _hash(s: str) -> str:
 
 
 class RedisCache:
+    """
+    Async Redis cache (non-blocking).
+    """
     def __init__(self, url: Optional[str] = None):
         url = (
             url
@@ -28,13 +32,20 @@ class RedisCache:
             or os.getenv("REDIS_URL")
             or "redis://redis:6379/0"
         )
-        self.r = redis.Redis.from_url(url, decode_responses=True)
+        self.r: Redis = Redis.from_url(url, decode_responses=True)
 
-    def get(self, key: str) -> Optional[str]:
-        return self.r.get(key)
+    async def get(self, key: str) -> Optional[str]:
+        return await self.r.get(key)
 
-    def setex(self, key: str, ttl: int, value: str) -> None:
-        self.r.setex(key, ttl, value)
+    async def setex(self, key: str, ttl: int, value: str) -> None:
+        # SETEX exists, but set(ex=ttl) is also fine.
+        await self.r.set(key, value, ex=ttl)
+
+    async def close(self) -> None:
+        try:
+            await self.r.aclose()
+        except Exception:
+            pass
 
 
 def default_key_builder(
@@ -65,6 +76,8 @@ def cache_response(
     vary_user: bool = False,
     key_builder: Callable[..., str] = default_key_builder,
     cache: Optional[RedisCache] = None,
+    # Если Redis упал — не валим ручку.
+    fail_open: bool = True,
 ):
     cache = cache or RedisCache()
 
@@ -72,18 +85,22 @@ def cache_response(
         sig = inspect.signature(fn)
         is_async = inspect.iscoroutinefunction(fn)
 
+        async def _call_handler(*args, **kwargs):
+            if is_async:
+                return await fn(*args, **kwargs)
+            # sync handler -> threadpool (не блокируем loop)
+            return await anyio.to_thread.run_sync(lambda: fn(*args, **kwargs))
+
         @wraps(fn)
         async def wrapper(*args, **kwargs):
             # FastAPI обычно прокидывает request как kwarg, но иногда он в args
             request = kwargs.get("request")
             if request is None:
                 for a in args:
-                    # crude heuristic: request has .url and .method
                     if hasattr(a, "url") and hasattr(a, "method"):
                         request = a
                         break
 
-            # If we can't see request, fallback to function name
             path = getattr(getattr(request, "url", None), "path", None) or fn.__name__
             method = getattr(request, "method", "GET")
 
@@ -106,7 +123,14 @@ def cache_response(
 
             service = os.getenv("SERVICE_NAME", "unknown")
 
-            hit = cache.get(key)
+            # ---- GET ----
+            try:
+                hit = await cache.get(key)
+            except Exception:
+                hit = None
+                if not fail_open:
+                    raise
+
             if hit is not None:
                 cache_hits.labels(service=service, namespace=namespace).inc()
                 try:
@@ -117,10 +141,10 @@ def cache_response(
 
             cache_misses.labels(service=service, namespace=namespace).inc()
 
-            data = await fn(*args, **kwargs) if is_async else fn(*args, **kwargs)
+            # ---- COMPUTE ----
+            data = await _call_handler(*args, **kwargs)
 
-            # If endpoint returns Response, don't cache it (it may contain headers/stream)
-            # We intentionally keep it simple to avoid importing starlette here.
+            # Если это Response/Streaming/etc — не кешируем
             if hasattr(data, "body") and hasattr(data, "status_code"):
                 return data
 
@@ -130,10 +154,37 @@ def cache_response(
             except Exception:
                 return data
 
-            cache.setex(key, ttl, payload)
+            # ---- SET ----
+            try:
+                await cache.setex(key, ttl, payload)
+            except Exception:
+                if not fail_open:
+                    raise
+
             return data
 
         wrapper.__signature__ = sig  # FastAPI signature reflection
         return wrapper
 
     return deco
+
+def build_cache_key(
+    namespace: str,
+    path: str,
+    method: str = "GET",
+    route_params: Optional[dict] = None,
+    query_params: Optional[dict] = None,
+    vary_user: bool = False,
+    user_key: Optional[str] = None,
+    key_builder: Callable[..., str] = default_key_builder,
+) -> str:
+    return key_builder(
+        namespace=namespace,
+        path=path,
+        method=method,
+        route_params=route_params or {},
+        query_params=query_params or {},
+        vary_user=vary_user,
+        user_key=user_key,
+    )
+

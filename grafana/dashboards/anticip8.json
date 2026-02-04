@@ -9,6 +9,34 @@
   "panels": [
     {
       "type": "timeseries",
+      "title": "Cache hit rate (orders namespace)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(anticip8_cache_hits_total{namespace=\"orders\"}[1m])) / clamp_min(sum(rate(anticip8_cache_hits_total{namespace=\"orders\"}[1m])) + sum(rate(anticip8_cache_misses_total{namespace=\"orders\"}[1m])), 1e-9)",
+          "refId": "A"
+        }
+      ]
+    },
+    {   
+      "type": "timeseries",
+      "title": "Cache hits / misses (orders namespace)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(anticip8_cache_hits_total{namespace=\"orders\"}[1m]))",
+          "refId": "A",
+          "legendFormat": "hits/s"
+        },
+        {
+          "expr": "sum(rate(anticip8_cache_misses_total{namespace=\"orders\"}[1m]))",
+          "refId": "B",
+          "legendFormat": "misses/s"
+        }
+      ]}
+      ,
+    {
+      "type": "timeseries",
       "title": "Cache hit rate (options namespace)",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
       "targets": [

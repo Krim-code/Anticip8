@@ -5,8 +5,9 @@ import time
 import json
 import asyncio
 import random
+import secrets
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Any, List
+from typing import Dict, Optional, Tuple, Any, List, Callable, Awaitable
 
 import httpx
 import redis
@@ -18,7 +19,8 @@ from .metrics import (
     policy_requests, policy_errors, policy_latency,
     prefetch_hits, prefetch_misses,
     prefetch_deadline_skips, prefetch_dedup_skips, prefetch_budget_overrun,
-    prefetch_mark_not_ready, intent_seen, prefetch_mark_ready, intent_missing
+    prefetch_mark_not_ready, intent_seen, prefetch_mark_ready, intent_missing,
+    race_grace_hits, race_grace_misses, race_grace_wait,
 )
 
 import logging
@@ -73,11 +75,23 @@ SKIP_PREFIXES = (
 def _sess_key(user_key: str) -> str:
     return f"anticip8:sess:{user_key}"
 
+
 def _pf_key(user_key: str, svc: str, req_key: str) -> str:
     return f"anticip8:pf:{user_key}:{svc}:{req_key}"
 
+
 def _intent_key(user_key: str, svc: str, req_key: str) -> str:
     return f"anticip8:intent:{user_key}:{svc}:{req_key}"
+
+
+def _policy_debounce_key(service_name: str, user_key: str, src_path: str) -> str:
+    # path-only key; intentionally ignores qs to avoid blowing cardinality
+    return f"anticip8:policy_seen:{service_name}:{user_key}:{src_path}"
+
+
+def _inflight_key(user_key: str, svc: str, req_key: str) -> str:
+    # per-user dedup (safe baseline). if you want global dedup, drop {user_key}.
+    return f"anticip8:inflight:{user_key}:{svc}:{req_key}"
 
 
 # =========================
@@ -131,6 +145,38 @@ def _make_req_key(path: str, query_string: bytes) -> str:
         return path
     qs = "&".join([f"{k}={v}" if v != "" else k for k, v in filtered])
     return f"{path}?{qs}"
+
+
+# =========================
+# Internal prefetch registry (HYBRID)
+# =========================
+@dataclass
+class PrefetchCtx:
+    user_key: str
+    service_name: str
+    src_path: str
+    src_qs: bytes
+    dst_path: str
+    dst_req_key: str
+    deadline: float
+    is_prefetch: bool = True
+
+
+_InternalFn = Callable[..., Awaitable[Any]]
+_INTERNAL_PREFETCHERS: Dict[str, _InternalFn] = {}
+# key = path template exactly as policy returns, e.g. "/api/v1/order-options/{id}"
+
+
+def register_internal_prefetch(path_tpl: str):
+    """
+    Usage:
+      @register_internal_prefetch("/api/v1/order-options/{id}")
+      async def _(ctx: PrefetchCtx, id: int): ...
+    """
+    def deco(fn: _InternalFn):
+        _INTERNAL_PREFETCHERS[path_tpl] = fn
+        return fn
+    return deco
 
 
 # =========================
@@ -211,7 +257,7 @@ class Anticip8Middleware:
         session_ttl_sec: int = 1800,
         prefetch_mark_ttl_sec: int = 60,
         intent_ttl_sec: int = 45,
-        max_prefetch_concurrency: int = 5,
+        max_prefetch_concurrency: int = 1,  # default 1
         inflight_ttl_sec: float = 2.0,
         default_prefetch_budget_ms: int = 250,
         http_connect_timeout: float = 1.0,
@@ -238,7 +284,7 @@ class Anticip8Middleware:
         rurl = redis_url or os.getenv("REDIS_URL") or "redis://redis:6379/0"
         self.r = redis.Redis.from_url(rurl, decode_responses=True)
 
-        # Prefer env overrides if present (so you don't forget to pass in add_middleware)
+        # Prefer env overrides if present
         self.session_ttl_sec = int(os.getenv("ANTICIP8_SESSION_TTL_SEC", str(session_ttl_sec)))
         self.prefetch_mark_ttl_sec = int(os.getenv("ANTICIP8_PREFETCH_MARK_TTL_SEC", str(prefetch_mark_ttl_sec)))
         self.intent_ttl_sec = int(os.getenv("ANTICIP8_INTENT_TTL_SEC", str(intent_ttl_sec)))
@@ -246,7 +292,14 @@ class Anticip8Middleware:
         self.inflight_ttl_sec = float(os.getenv("ANTICIP8_INFLIGHT_TTL_SEC", str(inflight_ttl_sec)))
         self.default_prefetch_budget_ms = int(os.getenv("ANTICIP8_PREFETCH_BUDGET_MS", str(default_prefetch_budget_ms)))
 
-        self.prefetch_sem = asyncio.Semaphore(int(os.getenv("ANTICIP8_PREFETCH_MAX_CONCURRENCY", str(max_prefetch_concurrency))))
+        # knobs
+        self.policy_debounce_sec = float(os.getenv("ANTICIP8_POLICY_DEBOUNCE_SEC", "0.5"))
+        self.prefetch_min_score = float(os.getenv("ANTICIP8_PREFETCH_MIN_SCORE", "0.25"))
+        self.min_prefetch_remain_ms = int(os.getenv("ANTICIP8_PREFETCH_MIN_REMAIN_MS", "40"))
+
+        self.prefetch_sem = asyncio.Semaphore(
+            int(os.getenv("ANTICIP8_PREFETCH_MAX_CONCURRENCY", str(max_prefetch_concurrency)))
+        )
 
         self.max_batch_inflight = int(os.getenv("ANTICIP8_PREFETCH_MAX_BATCH_INFLIGHT", "2"))
         self.min_prefetch_window_sec = float(os.getenv("ANTICIP8_MIN_PREFETCH_WINDOW_SEC", "0.08"))
@@ -276,10 +329,15 @@ class Anticip8Middleware:
         )
         self._http: Optional[httpx.AsyncClient] = None
 
-        self._inflight: Dict[Tuple[str, str, str], float] = {}
-        self._lock = asyncio.Lock()
+        # Redis-based inflight release script (delete only if token matches)
+        self._lua_release_inflight = """
+        if redis.call('GET', KEYS[1]) == ARGV[1] then
+            return redis.call('DEL', KEYS[1])
+        else
+            return 0
+        end
+        """
 
-        # show resolved config once (helps you catch the "ttl=60 but env says 180" bullshit)
         if LOG_PREFETCH:
             _jlog("ANTICIP8_CFG", {
                 "svc": self.service_name,
@@ -289,12 +347,43 @@ class Anticip8Middleware:
                 "batch_inflight": self.max_batch_inflight,
                 "min_window": self.min_prefetch_window_sec,
                 "sem": int(getattr(self.prefetch_sem, "_value", 0)),
+                "policy_debounce_sec": self.policy_debounce_sec,
+                "prefetch_min_score": self.prefetch_min_score,
+                "min_prefetch_remain_ms": self.min_prefetch_remain_ms,
+                "inflight_ttl_sec": self.inflight_ttl_sec,
+                "internal_prefetchers": len(_INTERNAL_PREFETCHERS),
             })
 
     async def _get_http(self) -> httpx.AsyncClient:
         if self._http is None:
             self._http = httpx.AsyncClient(timeout=self.timeout, limits=self.limits)
         return self._http
+
+    # -------------------------
+    # Distributed inflight dedup (Redis)
+    # -------------------------
+    def _acquire_inflight(self, user_key: str, svc: str, req_key: str, ttl_sec: float) -> Optional[str]:
+        """
+        Returns token if acquired, else None.
+        Uses SET key token NX PX ttl_ms
+        """
+        k = _inflight_key(user_key, svc, req_key)
+        token = secrets.token_hex(8)
+        try:
+            ok = self.r.set(k, token, nx=True, px=int(ttl_sec * 1000))
+            return token if ok else None
+        except Exception:
+            # Redis glitch -> degrade: run prefetch without dedup.
+            return token
+
+    def _release_inflight(self, user_key: str, svc: str, req_key: str, token: Optional[str]) -> None:
+        if not token:
+            return
+        k = _inflight_key(user_key, svc, req_key)
+        try:
+            self.r.eval(self._lua_release_inflight, 1, k, token)
+        except Exception:
+            pass
 
     def _get_prev_and_set_current(self, user_key: str, path: str) -> Tuple[Optional[str], Optional[str]]:
         key = _sess_key(user_key)
@@ -324,10 +413,12 @@ class Anticip8Middleware:
         pk = _pf_key(user_key, self.service_name, req_key)
         return (self.r.get(ik) is not None, self.r.get(pk) is not None)
 
-    def _check_prefetch_hit(self, user_key: str, req_key: str):
+    async def _check_prefetch_hit(self, user_key: str, req_key: str):
         ik = _intent_key(user_key, self.service_name, req_key)
         intent = self.r.get(ik)
+
         if intent is None:
+            intent_missing.labels(service=self.service_name).inc()
             if LOG_HITMISS and _log_ok(user_key):
                 _jlog("HITMISS", {
                     "svc": self.service_name,
@@ -335,24 +426,60 @@ class Anticip8Middleware:
                     "req_key": req_key,
                     "result": "NO_INTENT",
                 })
-            intent_seen.labels(service=self.service_name).inc()
-        else:
-            intent_missing.labels(service=self.service_name).inc()
+            return
 
+        intent_seen.labels(service=self.service_name).inc()
 
-        k = _pf_key(user_key, self.service_name, req_key)
-        has_pf = self.r.get(k) is not None
+        pk = _pf_key(user_key, self.service_name, req_key)
+        has_pf = self.r.get(pk) is not None
 
         if has_pf:
-            prefetch_hits.labels(service=self.service_name).inc()
             prefetch_mark_ready.labels(service=self.service_name).inc()
-            self.r.delete(k)
-            res = "HIT"
-        else:
-            prefetch_mark_not_ready.labels(service=self.service_name).inc()
-            prefetch_misses.labels(service=self.service_name).inc()
-            res = "MISS"
+            prefetch_hits.labels(service=self.service_name).inc()
+            self.r.delete(pk)
+            self.r.delete(ik)
 
+            if LOG_HITMISS and _log_ok(user_key):
+                _jlog("HITMISS", {
+                    "svc": self.service_name,
+                    "user": user_key,
+                    "req_key": req_key,
+                    "result": "HIT",
+                })
+            return
+
+        prefetch_mark_not_ready.labels(service=self.service_name).inc()
+
+        grace_ms = int(os.getenv("ANTICIP8_RACE_GRACE_MS", "0"))
+        grace_max_ms = int(os.getenv("ANTICIP8_RACE_GRACE_MAX_MS", "80"))
+        if grace_ms > 0:
+            grace_ms = min(grace_ms, grace_max_ms)
+
+            t0 = time.perf_counter()
+            await asyncio.sleep(grace_ms / 1000.0)
+            race_grace_wait.labels(service=self.service_name).observe(time.perf_counter() - t0)
+
+            has_pf_after = self.r.get(pk) is not None
+            if has_pf_after:
+                race_grace_hits.labels(service=self.service_name).inc()
+                prefetch_hits.labels(service=self.service_name).inc()
+
+                self.r.delete(pk)
+                self.r.delete(ik)
+
+                if LOG_HITMISS and _log_ok(user_key):
+                    _jlog("HITMISS", {
+                        "svc": self.service_name,
+                        "user": user_key,
+                        "req_key": req_key,
+                        "result": "HIT_RACE",
+                        "grace_ms": grace_ms,
+                    })
+                return
+
+            race_grace_misses.labels(service=self.service_name).inc()
+
+        prefetch_misses.labels(service=self.service_name).inc()
         self.r.delete(ik)
 
         if LOG_HITMISS and _log_ok(user_key):
@@ -360,7 +487,8 @@ class Anticip8Middleware:
                 "svc": self.service_name,
                 "user": user_key,
                 "req_key": req_key,
-                "result": res,
+                "result": "MISS",
+                "grace_ms": grace_ms,
             })
 
     # -------------------------
@@ -402,7 +530,6 @@ class Anticip8Middleware:
                 "ua": h("user-agent"),
             })
 
-        # IMPORTANT: probe BEFORE deletion
         if LOG_HITMISS and _log_ok(user_key):
             intent, pf = self._probe_intent_pf(user_key, req_key)
             _jlog("HITMISS_PROBE", {
@@ -413,8 +540,7 @@ class Anticip8Middleware:
                 "pf_mark": pf,
             })
 
-        # hit/miss check BEFORE request (will delete keys)
-        self._check_prefetch_hit(user_key, req_key)
+        await self._check_prefetch_hit(user_key, req_key)
 
         if LOG_HITMISS and _log_ok(user_key):
             intent2, pf2 = self._probe_intent_pf(user_key, req_key)
@@ -479,27 +605,44 @@ class Anticip8Middleware:
                 _jlog("PREFETCH_STOP_BREAKER", {"svc": self.service_name, "user": user_key, "src": src_path})
             return
 
+        # policy debounce
+        if self.policy_debounce_sec > 0:
+            try:
+                dk = _policy_debounce_key(self.service_name, user_key, src_path)
+                px = int(self.policy_debounce_sec * 1000)
+                ok = self.r.set(dk, "1", nx=True, px=px)
+                if not ok:
+                    if LOG_PREFETCH and _log_ok(user_key):
+                        _jlog("PREFETCH_POLICY_DEBOUNCE", {"svc": self.service_name, "user": user_key, "src": src_path, "px": px})
+                    return
+            except Exception:
+                pass
+
         pol_cache_key = f"{self.service_name}:{src_path}"
 
-        policy_requests.labels(service=self.service_name).inc()
-        t0 = time.perf_counter()
         pol: Optional[Dict[str, Any]] = None
-        try:
-            if self.policy_cache_ttl_sec > 0:
-                pol = await self.policy_cache.get(pol_cache_key)
+        if self.policy_cache_ttl_sec > 0:
+            pol = await self.policy_cache.get(pol_cache_key)
 
+        t0 = time.perf_counter()
+        called_core = False
+        try:
             if pol is None:
+                called_core = True
+                policy_requests.labels(service=self.service_name).inc()
                 pol = await self.client.get_policy(user_key, src_path, limit=3)
                 if self.policy_cache_ttl_sec > 0:
                     await self.policy_cache.set(pol_cache_key, pol, ttl_sec=self.policy_cache_ttl_sec)
 
         except Exception as e:
-            policy_errors.labels(service=self.service_name, reason=type(e).__name__).inc()
+            if called_core:
+                policy_errors.labels(service=self.service_name, reason=type(e).__name__).inc()
             if LOG_PREFETCH and _log_ok(user_key):
                 _jlog("PREFETCH_POLICY_ERR", {"svc": self.service_name, "user": user_key, "src": src_path, "err": repr(e)})
             return
         finally:
-            policy_latency.labels(service=self.service_name).observe(time.perf_counter() - t0)
+            if called_core:
+                policy_latency.labels(service=self.service_name).observe(time.perf_counter() - t0)
 
         next_paths: List[Dict[str, Any]] = (pol or {}).get("next_paths") or []
         max_prefetch = int((pol or {}).get("max_prefetch") or 0)
@@ -512,6 +655,12 @@ class Anticip8Middleware:
             max_prefetch = min(max_prefetch, self.max_items_cap)
 
         deadline = time.perf_counter() + (budget_ms / 1000.0)
+
+        remain_ms = (deadline - time.perf_counter()) * 1000.0
+        if remain_ms < float(self.min_prefetch_remain_ms):
+            prefetch_deadline_skips.labels(service=self.service_name).inc()
+            return
+
         if (deadline - time.perf_counter()) < self.min_prefetch_window_sec:
             prefetch_deadline_skips.labels(service=self.service_name).inc()
             return
@@ -522,18 +671,23 @@ class Anticip8Middleware:
         filtered: List[Dict[str, Any]] = []
         for it in next_paths:
             p_tpl = (it.get("path") or "")
+            score = float(it.get("score") or 0.0)
+
+            if score < self.prefetch_min_score:
+                continue
             if self.deny_re and self.deny_re.search(p_tpl):
                 continue
             if "{id}" in p_tpl and not src_has_int:
                 continue
             if "{uuid}" in p_tpl and not src_has_uuid:
                 continue
+
             filtered.append(it)
 
         if not filtered:
             return
 
-        targets = sorted(filtered, key=lambda x: x.get("score", 0.0), reverse=True)[:max_prefetch]
+        targets = sorted(filtered, key=lambda x: float(x.get("score") or 0.0), reverse=True)[:max_prefetch]
 
         per_req_timeout = float(os.getenv("ANTICIP8_PREFETCH_PER_REQUEST_TIMEOUT_SEC", "0"))
         if per_req_timeout <= 0:
@@ -548,6 +702,7 @@ class Anticip8Middleware:
                 "max_prefetch": max_prefetch,
                 "budget_ms": budget_ms,
                 "timeout": per_req_timeout,
+                "min_score": self.prefetch_min_score,
                 "targets": targets[:8],
             })
 
@@ -557,7 +712,8 @@ class Anticip8Middleware:
         pending: set[asyncio.Task] = set()
 
         for item in targets:
-            if (deadline - time.perf_counter()) < self.min_prefetch_window_sec:
+            remain_ms = (deadline - time.perf_counter()) * 1000.0
+            if remain_ms < float(self.min_prefetch_remain_ms):
                 prefetch_deadline_skips.labels(service=self.service_name).inc()
                 break
 
@@ -591,7 +747,10 @@ class Anticip8Middleware:
                 for t in not_done:
                     t.cancel()
                 prefetch_budget_overrun.labels(service=self.service_name).inc()
-                prefetch_deadline_skips.labels(service=self.service_name).inc(len(not_done))  # type: ignore
+                try:
+                    prefetch_deadline_skips.labels(service=self.service_name).inc(len(not_done))  # type: ignore
+                except Exception:
+                    prefetch_deadline_skips.labels(service=self.service_name).inc()
 
     # -------------------------
     # Prefetch single target
@@ -624,6 +783,7 @@ class Anticip8Middleware:
 
         p = p_tpl
 
+        # template -> concrete
         if "{id}" in p:
             m = RE_LAST_INT.search(src_path)
             if not m:
@@ -648,8 +808,8 @@ class Anticip8Middleware:
 
         url = f"{base}{p}"
 
-        # IMPORTANT: outgoing prefetch has no query => always path-only req_key
-        dst_req_key = p
+        # outgoing prefetch has no query => stable req_key (respects QUERY_MODE)
+        dst_req_key = _make_req_key(p, b"")
 
         if LOG_PREFETCH and _log_ok(user_key):
             _jlog("PREFETCH_REQ", {
@@ -662,9 +822,17 @@ class Anticip8Middleware:
                 "dst_req_key": dst_req_key,
                 "url": url,
                 "timeout": per_request_timeout,
+                "internal": bool(svc == self.service_name and _INTERNAL_PREFETCHERS.get(p_tpl)),
             })
 
-        # Mark intent before attempt
+        # Distributed inflight dedup (across workers/replicas)
+        inflight_ttl = max(self.inflight_ttl_sec, float(per_request_timeout) + 0.25)
+        token = self._acquire_inflight(user_key, svc, dst_req_key, inflight_ttl)
+        if token is None:
+            prefetch_dedup_skips.labels(service=self.service_name).inc()
+            return ret(False, "Dedup", dst_svc=svc, dst=p, url=url)
+
+        # Mark intent only if we own inflight lock (reduces intent spam)
         try:
             self.r.setex(_intent_key(user_key, svc, dst_req_key), self.intent_ttl_sec, "1")
             if LOG_PREFETCH and _log_ok(user_key):
@@ -674,22 +842,6 @@ class Anticip8Middleware:
         except Exception as e:
             if LOG_PREFETCH and _log_ok(user_key):
                 _jlog("PREFETCH_INTENT_ERR", {"user": user_key, "svc": svc, "dst_req_key": dst_req_key, "err": repr(e)})
-            # intent failing doesn't forbid doing prefetch attempt
-            pass
-
-        key = (user_key, svc, dst_req_key)
-        now = time.time()
-
-        async with self._lock:
-            for k, ts in list(self._inflight.items()):
-                if (now - ts) > self.inflight_ttl_sec:
-                    self._inflight.pop(k, None)
-
-            if key in self._inflight:
-                prefetch_dedup_skips.labels(service=self.service_name).inc()
-                return ret(False, "Dedup", dst_svc=svc, dst=p, url=url)
-
-            self._inflight[key] = now
 
         try:
             if time.perf_counter() >= deadline:
@@ -711,29 +863,89 @@ class Anticip8Middleware:
                 status: int = 0
                 err_name: Optional[str] = None
 
-                try:
-                    resp = await http.get(
-                        url,
-                        headers={"x-user": user_key, "x-prefetch": "1"},
-                        timeout=per_request_timeout,
+                # =========================
+                # HYBRID: internal prefetch if same service and resolver exists
+                # =========================
+                internal_fn = None
+                if svc == self.service_name:
+                    internal_fn = _INTERNAL_PREFETCHERS.get(p_tpl)
+
+                if internal_fn is not None:
+                    params: Dict[str, Any] = {}
+                    if "{id}" in p_tpl:
+                        m = RE_LAST_INT.search(src_path)
+                        if m:
+                            params["id"] = int(m.group(1))
+                    if "{uuid}" in p_tpl:
+                        m = RE_LAST_UUID.search(src_path)
+                        if m:
+                            params["uuid"] = m.group(1)
+
+                    ctx = PrefetchCtx(
+                        user_key=user_key,
+                        service_name=self.service_name,
+                        src_path=src_path,
+                        src_qs=src_qs,
+                        dst_path=p,
+                        dst_req_key=dst_req_key,
+                        deadline=deadline,
+                        is_prefetch=True,
                     )
-                    status = int(resp.status_code or 0)
 
-                except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
-                    err_name = type(e).__name__
-                    prefetch_errors.labels(service=self.service_name, reason=err_name).inc()
-                    await self.breaker.report_error()
+                    if LOG_PREFETCH and _log_ok(user_key):
+                        _jlog("PREFETCH_INTERNAL_TRY", {
+                            "svc": self.service_name,
+                            "user": user_key,
+                            "dst_tpl": p_tpl,
+                            "dst_path": p,
+                            "dst_req_key": dst_req_key,
+                            "params": params,
+                        })
 
-                except Exception as e:
-                    err_name = type(e).__name__
-                    prefetch_errors.labels(service=self.service_name, reason=err_name).inc()
-                    await self.breaker.report_error()
+                    try:
+                        # hard-bound by remaining time and per_request_timeout
+                        remain = max(0.0, deadline - time.perf_counter())
+                        internal_timeout = min(remain, float(per_request_timeout))
 
-                finally:
-                    dur = time.perf_counter() - t0
-                    prefetch_latency.labels(service=self.service_name).observe(dur)
+                        await asyncio.wait_for(internal_fn(ctx, **params), timeout=internal_timeout)
 
-                ms = int((time.perf_counter() - t0) * 1000)
+                        status = 200  # internal success means cache warmed
+                    except asyncio.TimeoutError:
+                        err_name = "InternalTimeout"
+                        prefetch_errors.labels(service=self.service_name, reason=err_name).inc()
+                        await self.breaker.report_error()
+                        status = 0
+                    except Exception as e:
+                        err_name = f"Internal:{type(e).__name__}"
+                        prefetch_errors.labels(service=self.service_name, reason=err_name).inc()
+                        await self.breaker.report_error()
+                        status = 0
+
+                else:
+                    # =========================
+                    # HTTP fallback
+                    # =========================
+                    try:
+                        resp = await http.get(
+                            url,
+                            headers={"x-user": user_key, "x-prefetch": "1"},
+                            timeout=per_request_timeout,
+                        )
+                        status = int(resp.status_code or 0)
+
+                    except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
+                        err_name = type(e).__name__
+                        prefetch_errors.labels(service=self.service_name, reason=err_name).inc()
+                        await self.breaker.report_error()
+
+                    except Exception as e:
+                        err_name = type(e).__name__
+                        prefetch_errors.labels(service=self.service_name, reason=err_name).inc()
+                        await self.breaker.report_error()
+
+                dur = time.perf_counter() - t0
+                prefetch_latency.labels(service=self.service_name).observe(dur)
+                ms = int(dur * 1000)
 
                 if LOG_PREFETCH and _log_ok(user_key):
                     _jlog("PREFETCH_RES", {
@@ -745,9 +957,11 @@ class Anticip8Middleware:
                         "status": status,
                         "ms": ms,
                         "err": err_name,
+                        "internal": bool(internal_fn is not None),
                     })
 
-                if status > 0:
+                # Mark only on success-ish responses; avoid fake HITs for 404/500
+                if 200 <= status < 400:
                     try:
                         self.r.setex(_pf_key(user_key, svc, dst_req_key), self.prefetch_mark_ttl_sec, "1")
                         if LOG_PREFETCH and _log_ok(user_key):
@@ -759,7 +973,6 @@ class Anticip8Middleware:
                         if LOG_PREFETCH and _log_ok(user_key):
                             _jlog("PREFETCH_MARK_ERR", {"user": user_key, "svc": svc, "dst_req_key": dst_req_key, "err": repr(e)})
 
-                    # optional ingest
                     try:
                         await self.client.ingest_prefetch(
                             user_key=user_key,
@@ -774,11 +987,10 @@ class Anticip8Middleware:
 
                     return ret(True, "OK", dst_svc=svc, dst=p, url=url, status=status, ms=ms)
 
-                return ret(False, err_name or "NoStatus", dst_svc=svc, dst=p, url=url, status=0, ms=ms)
+                return ret(False, err_name or "NoStatus", dst_svc=svc, dst=p, url=url, status=status, ms=ms)
 
         finally:
-            async with self._lock:
-                self._inflight.pop(key, None)
+            self._release_inflight(user_key, svc, dst_req_key, token)
 
     async def close(self):
         if self._http is not None:
