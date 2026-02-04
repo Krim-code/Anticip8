@@ -1,5 +1,6 @@
 # app/main.py
 import os
+import json
 import random
 import asyncio
 import hashlib
@@ -10,7 +11,7 @@ from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from anticip8_sdk import Anticip8Middleware, cache_response
 from anticip8_sdk.middleware import register_internal_prefetch, PrefetchCtx
-from anticip8_sdk.cache import RedisCache, build_cache_key  # <-- NEW
+from anticip8_sdk.cache import RedisCache, build_cache_key
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "orders-api")
 CORE_URL = os.getenv("ANTICIP8_CORE_URL", "http://anticip8-core:8000")
@@ -32,6 +33,10 @@ app.add_middleware(
 
 _cache = RedisCache()
 
+@app.on_event("shutdown")
+async def _shutdown():
+    await _cache.close()
+
 # ---------------- utils ----------------
 async def _sleep(ms_min: int, ms_max: int):
     await asyncio.sleep(random.randint(ms_min, ms_max) / 1000.0)
@@ -46,11 +51,18 @@ def _user(request: Request) -> str:
     return request.headers.get("x-user", "anon")
 
 def _ctx_user(ctx: PrefetchCtx) -> str:
-    # ctx.user_key должен быть (Anticip8 по нему живёт)
     u = getattr(ctx, "user_key", None) or getattr(ctx, "user", None)
     return u or "anon"
 
-def _cache_put_json(namespace: str, path: str, ttl: int, payload: dict, *, vary_user: bool = False, user_key: Optional[str] = None):
+async def _cache_put_json(
+    namespace: str,
+    path: str,
+    ttl: int,
+    payload: dict,
+    *,
+    vary_user: bool = False,
+    user_key: Optional[str] = None,
+):
     key = build_cache_key(
         namespace=namespace,
         path=path,
@@ -60,7 +72,11 @@ def _cache_put_json(namespace: str, path: str, ttl: int, payload: dict, *, vary_
         vary_user=vary_user,
         user_key=user_key,
     )
-    _cache.setex(key, ttl, json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    await _cache.setex(
+        key,
+        ttl,
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+    )
 
 # =====================================================
 # Internal implementations (NO Request in signature)
@@ -120,51 +136,48 @@ async def _feed_impl(uid: str):
     return {"user_id": uid, "widgets": rng.sample(widgets, 4)}
 
 # =====================================================
-# Internal prefetch: warm Redis cache DIRECTLY (no Request, no endpoint call)
+# Internal prefetch: warm Redis cache DIRECTLY
 # =====================================================
-
-import json  # needed for _cache_put_json
 
 @register_internal_prefetch("/orders/{order_id}")
 async def pf_order(ctx: PrefetchCtx, order_id: int):
     data = await _order_impl(order_id)
-    _cache_put_json("orders", f"/orders/{order_id}", 60, data)
+    await _cache_put_json("orders", f"/orders/{order_id}", 60, data)
 
 @register_internal_prefetch("/orders/{order_id}/items")
 async def pf_order_items(ctx: PrefetchCtx, order_id: int):
     data = await _order_items_impl(order_id)
-    _cache_put_json("orders", f"/orders/{order_id}/items", 90, data)
+    await _cache_put_json("orders", f"/orders/{order_id}/items", 90, data)
 
 @register_internal_prefetch("/orders/{order_id}/payment")
 async def pf_order_payment(ctx: PrefetchCtx, order_id: int):
     data = await _payment_impl(order_id)
-    _cache_put_json("orders", f"/orders/{order_id}/payment", 30, data)
+    await _cache_put_json("orders", f"/orders/{order_id}/payment", 30, data)
 
 @register_internal_prefetch("/basket/summary")
 async def pf_basket_summary(ctx: PrefetchCtx):
     uid = _ctx_user(ctx)
     data = await _basket_summary_impl(uid)
-    _cache_put_json("orders", "/basket/summary", 30, data, vary_user=True, user_key=uid)
+    await _cache_put_json("orders", "/basket/summary", 30, data, vary_user=True, user_key=uid)
 
 @register_internal_prefetch("/basket/items")
 async def pf_basket_items(ctx: PrefetchCtx):
     uid = _ctx_user(ctx)
     data = await _basket_items_impl(uid)
-    _cache_put_json("orders", "/basket/items", 45, data, vary_user=True, user_key=uid)
+    await _cache_put_json("orders", "/basket/items", 45, data, vary_user=True, user_key=uid)
 
 @register_internal_prefetch("/profile")
 async def pf_profile(ctx: PrefetchCtx):
     uid = _ctx_user(ctx)
     data = await _profile_impl(uid)
-    _cache_put_json("orders", "/profile", 120, data, vary_user=True, user_key=uid)
+    await _cache_put_json("orders", "/profile", 120, data, vary_user=True, user_key=uid)
 
 @register_internal_prefetch("/profile/history")
 async def pf_profile_history(ctx: PrefetchCtx):
     uid = _ctx_user(ctx)
     page = 1
     data = await _history_impl(uid, page)
-    # ВАЖНО: key builder учитывает query_params, а у нас page — query
-    # Поэтому добавим query_params в ключ, иначе endpoint не попадёт в этот кеш.
+
     key = build_cache_key(
         namespace="orders",
         path="/profile/history",
@@ -174,13 +187,17 @@ async def pf_profile_history(ctx: PrefetchCtx):
         vary_user=True,
         user_key=uid,
     )
-    _cache.setex(key, 120, json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    await _cache.setex(
+        key,
+        120,
+        json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+    )
 
 @register_internal_prefetch("/feed")
 async def pf_feed(ctx: PrefetchCtx):
     uid = _ctx_user(ctx)
     data = await _feed_impl(uid)
-    _cache_put_json("orders", "/feed", 25, data, vary_user=True, user_key=uid)
+    await _cache_put_json("orders", "/feed", 25, data, vary_user=True, user_key=uid)
 
 # ---------------- endpoints ----------------
 
@@ -252,7 +269,12 @@ async def feed(request: Request):
 
 @app.get("/_whoami")
 async def whoami(request: Request):
-    return {"service": SERVICE_NAME, "x_user": _user(request), "env_SERVICE_NAME": os.getenv("SERVICE_NAME"), "env_CORE": os.getenv("ANTICIP8_CORE_URL")}
+    return {
+        "service": SERVICE_NAME,
+        "x_user": _user(request),
+        "env_SERVICE_NAME": os.getenv("SERVICE_NAME"),
+        "env_CORE": os.getenv("ANTICIP8_CORE_URL"),
+    }
 
 @app.get("/metrics")
 async def metrics():

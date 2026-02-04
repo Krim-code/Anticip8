@@ -10,10 +10,12 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, Any, List, Callable, Awaitable
 
 import httpx
-import redis
+from redis.asyncio import Redis
+import redis.asyncio as redis
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .client import Anticip8Client
+from .chainlog import log_step
 from .metrics import (
     prefetch_total, prefetch_errors, prefetch_latency,
     policy_requests, policy_errors, policy_latency,
@@ -282,7 +284,9 @@ class Anticip8Middleware:
         self.base_urls = {k: v.rstrip("/") for k, v in (base_urls or {}).items()}
 
         rurl = redis_url or os.getenv("REDIS_URL") or "redis://redis:6379/0"
-        self.r = redis.Redis.from_url(rurl, decode_responses=True)
+        self.r: Redis = redis.from_url(rurl, decode_responses=True)
+        ranalytics = redis_url or os.getenv("ANTICIP8_ANALYTICS_REDIS_URL") or "redis://redis_analytics:6379/0"
+        self.ra: Redis = redis.from_url(ranalytics, decode_responses=True)
 
         # Prefer env overrides if present
         self.session_ttl_sec = int(os.getenv("ANTICIP8_SESSION_TTL_SEC", str(session_ttl_sec)))
@@ -362,34 +366,30 @@ class Anticip8Middleware:
     # -------------------------
     # Distributed inflight dedup (Redis)
     # -------------------------
-    def _acquire_inflight(self, user_key: str, svc: str, req_key: str, ttl_sec: float) -> Optional[str]:
-        """
-        Returns token if acquired, else None.
-        Uses SET key token NX PX ttl_ms
-        """
+    async def _acquire_inflight(self, user_key: str, svc: str, req_key: str, ttl_sec: float) -> Optional[str]:
         k = _inflight_key(user_key, svc, req_key)
         token = secrets.token_hex(8)
         try:
-            ok = self.r.set(k, token, nx=True, px=int(ttl_sec * 1000))
+            ok = await self.r.set(k, token, nx=True, px=int(ttl_sec * 1000))
             return token if ok else None
         except Exception:
             # Redis glitch -> degrade: run prefetch without dedup.
             return token
 
-    def _release_inflight(self, user_key: str, svc: str, req_key: str, token: Optional[str]) -> None:
+    async def _release_inflight(self, user_key: str, svc: str, req_key: str, token: Optional[str]) -> None:
         if not token:
             return
         k = _inflight_key(user_key, svc, req_key)
         try:
-            self.r.eval(self._lua_release_inflight, 1, k, token)
+            await self.r.eval(self._lua_release_inflight, 1, k, token)
         except Exception:
             pass
 
-    def _get_prev_and_set_current(self, user_key: str, path: str) -> Tuple[Optional[str], Optional[str]]:
+    async def _get_prev_and_set_current(self, user_key: str, path: str) -> Tuple[Optional[str], Optional[str]]:
         key = _sess_key(user_key)
         prev_svc = prev_path = None
 
-        raw = self.r.get(key)
+        raw = await self.r.get(key)
         if raw:
             try:
                 obj = json.loads(raw)
@@ -398,7 +398,7 @@ class Anticip8Middleware:
             except Exception:
                 prev_svc = prev_path = None
 
-        self.r.setex(
+        await self.r.setex(
             key,
             self.session_ttl_sec,
             json.dumps({"svc": self.service_name, "path": path, "ts": int(time.time())}),
@@ -408,14 +408,15 @@ class Anticip8Middleware:
     # -------------------------
     # Hit/miss accounting
     # -------------------------
-    def _probe_intent_pf(self, user_key: str, req_key: str) -> Tuple[bool, bool]:
+    async def _probe_intent_pf(self, user_key: str, req_key: str) -> Tuple[bool, bool]:
         ik = _intent_key(user_key, self.service_name, req_key)
         pk = _pf_key(user_key, self.service_name, req_key)
-        return (self.r.get(ik) is not None, self.r.get(pk) is not None)
+        a, b = await self.r.mget(ik, pk)
+        return (a is not None, b is not None)
 
     async def _check_prefetch_hit(self, user_key: str, req_key: str):
         ik = _intent_key(user_key, self.service_name, req_key)
-        intent = self.r.get(ik)
+        intent = await self.r.get(ik)
 
         if intent is None:
             intent_missing.labels(service=self.service_name).inc()
@@ -431,13 +432,16 @@ class Anticip8Middleware:
         intent_seen.labels(service=self.service_name).inc()
 
         pk = _pf_key(user_key, self.service_name, req_key)
-        has_pf = self.r.get(pk) is not None
+        has_pf = (await self.r.get(pk)) is not None
 
         if has_pf:
             prefetch_mark_ready.labels(service=self.service_name).inc()
             prefetch_hits.labels(service=self.service_name).inc()
-            self.r.delete(pk)
-            self.r.delete(ik)
+
+            pipe = self.r.pipeline(transaction=False)
+            pipe.delete(pk)
+            pipe.delete(ik)
+            await pipe.execute()
 
             if LOG_HITMISS and _log_ok(user_key):
                 _jlog("HITMISS", {
@@ -459,13 +463,15 @@ class Anticip8Middleware:
             await asyncio.sleep(grace_ms / 1000.0)
             race_grace_wait.labels(service=self.service_name).observe(time.perf_counter() - t0)
 
-            has_pf_after = self.r.get(pk) is not None
+            has_pf_after = (await self.r.get(pk)) is not None
             if has_pf_after:
                 race_grace_hits.labels(service=self.service_name).inc()
                 prefetch_hits.labels(service=self.service_name).inc()
 
-                self.r.delete(pk)
-                self.r.delete(ik)
+                pipe = self.r.pipeline(transaction=False)
+                pipe.delete(pk)
+                pipe.delete(ik)
+                await pipe.execute()
 
                 if LOG_HITMISS and _log_ok(user_key):
                     _jlog("HITMISS", {
@@ -480,7 +486,7 @@ class Anticip8Middleware:
             race_grace_misses.labels(service=self.service_name).inc()
 
         prefetch_misses.labels(service=self.service_name).inc()
-        self.r.delete(ik)
+        await self.r.delete(ik)
 
         if LOG_HITMISS and _log_ok(user_key):
             _jlog("HITMISS", {
@@ -530,8 +536,17 @@ class Anticip8Middleware:
                 "ua": h("user-agent"),
             })
 
+        # Chain analytics logging (async, non-blocking)
+        if os.getenv("ANTICIP8_CHAINLOG", "1") == "1":
+            try:
+                asyncio.create_task(
+                    log_step(self.ra, self.service_name, user_key, req_key, per_user=True, enable_trigram=True)
+                )
+            except Exception:
+                pass
+
         if LOG_HITMISS and _log_ok(user_key):
-            intent, pf = self._probe_intent_pf(user_key, req_key)
+            intent, pf = await self._probe_intent_pf(user_key, req_key)
             _jlog("HITMISS_PROBE", {
                 "svc": self.service_name,
                 "user": user_key,
@@ -543,7 +558,7 @@ class Anticip8Middleware:
         await self._check_prefetch_hit(user_key, req_key)
 
         if LOG_HITMISS and _log_ok(user_key):
-            intent2, pf2 = self._probe_intent_pf(user_key, req_key)
+            intent2, pf2 = await self._probe_intent_pf(user_key, req_key)
             _jlog("HITMISS_AFTER", {
                 "svc": self.service_name,
                 "user": user_key,
@@ -552,7 +567,7 @@ class Anticip8Middleware:
                 "pf_mark": pf2,
             })
 
-        prev_svc, prev_path = self._get_prev_and_set_current(user_key, path)
+        prev_svc, prev_path = await self._get_prev_and_set_current(user_key, path)
 
         async def send_wrapper(message):
             nonlocal status_code, prefetch_scheduled
@@ -610,10 +625,12 @@ class Anticip8Middleware:
             try:
                 dk = _policy_debounce_key(self.service_name, user_key, src_path)
                 px = int(self.policy_debounce_sec * 1000)
-                ok = self.r.set(dk, "1", nx=True, px=px)
+                ok = await self.r.set(dk, "1", nx=True, px=px)
                 if not ok:
                     if LOG_PREFETCH and _log_ok(user_key):
-                        _jlog("PREFETCH_POLICY_DEBOUNCE", {"svc": self.service_name, "user": user_key, "src": src_path, "px": px})
+                        _jlog("PREFETCH_POLICY_DEBOUNCE", {
+                            "svc": self.service_name, "user": user_key, "src": src_path, "px": px
+                        })
                     return
             except Exception:
                 pass
@@ -638,13 +655,16 @@ class Anticip8Middleware:
             if called_core:
                 policy_errors.labels(service=self.service_name, reason=type(e).__name__).inc()
             if LOG_PREFETCH and _log_ok(user_key):
-                _jlog("PREFETCH_POLICY_ERR", {"svc": self.service_name, "user": user_key, "src": src_path, "err": repr(e)})
+                _jlog("PREFETCH_POLICY_ERR", {
+                    "svc": self.service_name, "user": user_key, "src": src_path, "err": repr(e)
+                })
             return
         finally:
             if called_core:
                 policy_latency.labels(service=self.service_name).observe(time.perf_counter() - t0)
 
         next_paths: List[Dict[str, Any]] = (pol or {}).get("next_paths") or []
+        
         max_prefetch = int((pol or {}).get("max_prefetch") or 0)
         budget_ms = int((pol or {}).get("max_prefetch_time_ms") or self.default_prefetch_budget_ms)
 
@@ -827,14 +847,14 @@ class Anticip8Middleware:
 
         # Distributed inflight dedup (across workers/replicas)
         inflight_ttl = max(self.inflight_ttl_sec, float(per_request_timeout) + 0.25)
-        token = self._acquire_inflight(user_key, svc, dst_req_key, inflight_ttl)
+        token = await self._acquire_inflight(user_key, svc, dst_req_key, inflight_ttl)
         if token is None:
             prefetch_dedup_skips.labels(service=self.service_name).inc()
             return ret(False, "Dedup", dst_svc=svc, dst=p, url=url)
 
         # Mark intent only if we own inflight lock (reduces intent spam)
         try:
-            self.r.setex(_intent_key(user_key, svc, dst_req_key), self.intent_ttl_sec, "1")
+            await self.r.setex(_intent_key(user_key, svc, dst_req_key), self.intent_ttl_sec, "1")
             if LOG_PREFETCH and _log_ok(user_key):
                 _jlog("PREFETCH_INTENT_SET", {
                     "user": user_key, "svc": svc, "dst_req_key": dst_req_key, "dst_path": p, "ttl": self.intent_ttl_sec
@@ -903,12 +923,9 @@ class Anticip8Middleware:
                         })
 
                     try:
-                        # hard-bound by remaining time and per_request_timeout
                         remain = max(0.0, deadline - time.perf_counter())
                         internal_timeout = min(remain, float(per_request_timeout))
-
                         await asyncio.wait_for(internal_fn(ctx, **params), timeout=internal_timeout)
-
                         status = 200  # internal success means cache warmed
                     except asyncio.TimeoutError:
                         err_name = "InternalTimeout"
@@ -963,7 +980,7 @@ class Anticip8Middleware:
                 # Mark only on success-ish responses; avoid fake HITs for 404/500
                 if 200 <= status < 400:
                     try:
-                        self.r.setex(_pf_key(user_key, svc, dst_req_key), self.prefetch_mark_ttl_sec, "1")
+                        await self.r.setex(_pf_key(user_key, svc, dst_req_key), self.prefetch_mark_ttl_sec, "1")
                         if LOG_PREFETCH and _log_ok(user_key):
                             _jlog("PREFETCH_MARK_SET", {
                                 "user": user_key, "svc": svc, "dst_req_key": dst_req_key,
@@ -990,10 +1007,14 @@ class Anticip8Middleware:
                 return ret(False, err_name or "NoStatus", dst_svc=svc, dst=p, url=url, status=status, ms=ms)
 
         finally:
-            self._release_inflight(user_key, svc, dst_req_key, token)
+            await self._release_inflight(user_key, svc, dst_req_key, token)
 
     async def close(self):
         if self._http is not None:
             await self._http.aclose()
             self._http = None
+        try:
+            await self.r.aclose()
+        except Exception:
+            pass
         await self.client.close()

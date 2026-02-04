@@ -1,7 +1,16 @@
 services:
   redis:
     image: redis:7-alpine
-    ports: ["6379:6379"]
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  redis_analytics:
+      image: redis:7-alpine
+      command: >
+        redis-server --save "" --appendonly no --maxmemory 512mb --maxmemory-policy allkeys-lru
+      ports: ["6380:6379"]
+
 
   anticip8-core:
     build: ./core
@@ -28,12 +37,14 @@ services:
       dockerfile: services/orders_api/Dockerfile
     environment:
       SERVICE_NAME: orders-api
+      ANTICIP8_CHAINLOG: 1
       ANTICIP8_CORE_URL: http://anticip8-core:8000
       OPTIONS_BASE_URL: http://options-api:8000
+      ANTICIP8_ANALYTICS_REDIS_URL: redis://redis_analytics:6379/0
       ANTICIP8_INTENT_TTL_SEC: 120
       ANTICIP8_PREFETCH_MARK_TTL_SEC: 40
       ANTICIP8_PREFETCH_MAX_BATCH_INFLIGHT: "1"
-      ANTICIP8_PREFETCH_PER_REQUEST_TIMEOUT_SEC: "0.13"
+      ANTICIP8_PREFETCH_PER_REQUEST_TIMEOUT_SEC: "0.45"
       ANTICIP8_MIN_PREFETCH_WINDOW_SEC: "0.06"
       ANTICIP8_PREFETCH_MAX_CONCURRENCY: "2"
       ANTICIP8_QUERY_MODE: ignore
@@ -56,10 +67,11 @@ services:
       SERVICE_NAME: options-api
       ANTICIP8_INTENT_TTL_SEC: 120
       ANTICIP8_PREFETCH_MARK_TTL_SEC: 40
-      
+      ANTICIP8_CHAINLOG: 1
       ANTICIP8_CORE_URL: http://anticip8-core:8000
       ANTICIP8_PREFETCH_MAX_BATCH_INFLIGHT: "1"
-      ANTICIP8_PREFETCH_PER_REQUEST_TIMEOUT_SEC: "0.13"
+      ANTICIP8_ANALYTICS_REDIS_URL: redis://redis_analytics:6379/0
+      ANTICIP8_PREFETCH_PER_REQUEST_TIMEOUT_SEC: "0.45"
       ANTICIP8_MIN_PREFETCH_WINDOW_SEC: "0.06"
       ANTICIP8_PREFETCH_MAX_CONCURRENCY: "2"
       ANTICIP8_QUERY_MODE: ignore
@@ -134,3 +146,12 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on: [prometheus]
+
+  anticip8-analytics:
+      build: ./analytics
+      environment:
+        - ANTICIP8_ANALYTICS_REDIS_URL=redis://redis_analytics:6379/0
+      ports:
+        - "8010:8000"
+      depends_on:
+        - redis

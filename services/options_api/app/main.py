@@ -1,15 +1,18 @@
 # app/main.py
 import os
+import json
 import random
 import asyncio
 import hashlib
+from typing import Optional
 
 from fastapi import FastAPI, Request, Response
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from anticip8_sdk import Anticip8Middleware, cache_response
+from anticip8_sdk.cache import RedisCache, build_cache_key
 
-# optional internal prefetch (чтобы не падать, если модуля нет)
+# optional internal prefetch
 try:
     from anticip8_sdk.middleware import register_internal_prefetch, PrefetchCtx
     INTERNAL_PREFETCH = True
@@ -36,6 +39,12 @@ app.add_middleware(
     max_prefetch_concurrency=int(os.getenv("ANTICIP8_PREFETCH_MAX_CONCURRENCY", "2")),
 )
 
+_cache = RedisCache()
+
+@app.on_event("shutdown")
+async def _shutdown():
+    await _cache.close()
+
 # ---------------- utils ----------------
 async def _sleep(ms_min: int, ms_max: int):
     await asyncio.sleep(random.randint(ms_min, ms_max) / 1000.0)
@@ -49,12 +58,40 @@ def _rng(n: int) -> random.Random:
 def _user(request: Request) -> str:
     return request.headers.get("x-user", "anon")
 
+def _ctx_user(ctx: PrefetchCtx) -> str:
+    u = getattr(ctx, "user_key", None) or getattr(ctx, "user", None)
+    return u or "anon"
+
 def _rand_city(rng: random.Random) -> str:
     return rng.choice(["Helsinki", "Tampere", "Turku", "Oulu", "Espoo"])
 
+async def _cache_put_json(
+    namespace: str,
+    path: str,
+    ttl: int,
+    payload: dict,
+    *,
+    vary_user: bool = False,
+    user_key: Optional[str] = None,
+    query_params: Optional[dict] = None,
+):
+    key = build_cache_key(
+        namespace=namespace,
+        path=path,
+        method="GET",
+        route_params={},
+        query_params=query_params or {},
+        vary_user=vary_user,
+        user_key=user_key,
+    )
+    await _cache.setex(
+        key,
+        ttl,
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+    )
 
 # =====================================================
-# Implementations (можно принимать request=None)
+# Implementations
 # =====================================================
 async def _order_options_impl(order_id: int):
     await _sleep(120, 200)
@@ -136,35 +173,61 @@ async def _contacts_impl():
     await _sleep(40, 90)
     return [{"id": 1, "name": "Neo"}, {"id": 2, "name": "Trinity"}]
 
-
 # =====================================================
-# Internal prefetch (если доступен)
+# Internal prefetch: warm cache directly (NO ctx.request bullshit)
 # =====================================================
 if INTERNAL_PREFETCH:
 
     @register_internal_prefetch("/order-options/{order_id}")
     async def pf_order_options(ctx: PrefetchCtx, order_id: int):
-        await order_options(order_id, ctx.request)
+        data = await _order_options_impl(order_id)
+        await _cache_put_json("options", f"/order-options/{order_id}", 60, data)
 
     @register_internal_prefetch("/orders/{order_id}/pricing")
     async def pf_pricing(ctx: PrefetchCtx, order_id: int):
-        await pricing(order_id, ctx.request)
+        data = await _pricing_impl(order_id)
+        await _cache_put_json("pricing", f"/orders/{order_id}/pricing", 60, data)
 
     @register_internal_prefetch("/orders/{order_id}/delivery")
     async def pf_delivery(ctx: PrefetchCtx, order_id: int):
-        await delivery(order_id, ctx.request)
+        data = await _delivery_impl(order_id)
+        await _cache_put_json("delivery", f"/orders/{order_id}/delivery", 60, data)
 
     @register_internal_prefetch("/catalog/products/{product_id}")
     async def pf_product(ctx: PrefetchCtx, product_id: int):
-        await product(product_id, ctx.request)
+        data = await _product_impl(product_id)
+        await _cache_put_json("product", f"/catalog/products/{product_id}", 120, data)
 
     @register_internal_prefetch("/customers/{customer_id}/addresses")
     async def pf_customer_addresses(ctx: PrefetchCtx, customer_id: int):
-        await customer_addresses(customer_id, ctx.request)
+        data = await _customer_addresses_impl(customer_id)
+        await _cache_put_json("addr", f"/customers/{customer_id}/addresses", 120, data)
 
+    # опционально: user-scoped штуки тоже можно греть
+    @register_internal_prefetch("/recommendations")
+    async def pf_recommendations(ctx: PrefetchCtx):
+        uid = _ctx_user(ctx)
+        data = await _recommendations_impl(uid)
+        await _cache_put_json("reco", "/recommendations", 30, data, vary_user=True, user_key=uid)
+
+    @register_internal_prefetch("/support/tickets")
+    async def pf_tickets(ctx: PrefetchCtx):
+        uid = _ctx_user(ctx)
+        status = "open"
+        data = await _tickets_impl(uid, status)
+        # status — query param, его надо учесть в ключе
+        await _cache_put_json(
+            "tickets",
+            "/support/tickets",
+            30,
+            data,
+            vary_user=True,
+            user_key=uid,
+            query_params={"status": status},
+        )
 
 # =====================================================
-# Endpoints (Request ВСЕГДА не Optional)
+# Endpoints
 # =====================================================
 @app.get("/order-options/{order_id}")
 @cache_response(ttl=60, namespace="options")
@@ -204,7 +267,6 @@ async def categories():
 
 @app.get("/catalog/products")
 async def products(category: int = 1, q: str = "", page: int = 1):
-    # вариативная -> не кешируем (можно кешировать с TTL=10 и normalized q/page, если надо)
     return await _products_impl(category, q, page)
 
 @app.get("/catalog/products/{product_id}")
@@ -217,6 +279,7 @@ async def reviews(product_id: int, page: int = 1):
     return await _reviews_impl(product_id, page)
 
 @app.get("/recommendations")
+@cache_response(ttl=30, namespace="reco", vary_user=True)
 async def recommendations(request: Request, user_id: str = "u_test"):
     uid = _user(request) or user_id
     return await _recommendations_impl(uid)
@@ -226,6 +289,7 @@ async def promos():
     return await _promos_impl()
 
 @app.get("/support/tickets")
+@cache_response(ttl=30, namespace="tickets", vary_user=True)
 async def tickets(request: Request, user_id: str = "u_test", status: str = "open"):
     uid = _user(request) or user_id
     return await _tickets_impl(uid, status)
@@ -236,7 +300,12 @@ async def ticket(ticket_id: int):
 
 @app.get("/_whoami")
 async def whoami(request: Request):
-    return {"service": SERVICE_NAME, "x_user": _user(request), "env_SERVICE_NAME": os.getenv("SERVICE_NAME"), "env_CORE": os.getenv("ANTICIP8_CORE_URL")}
+    return {
+        "service": SERVICE_NAME,
+        "x_user": _user(request),
+        "env_SERVICE_NAME": os.getenv("SERVICE_NAME"),
+        "env_CORE": os.getenv("ANTICIP8_CORE_URL"),
+    }
 
 @app.get("/metrics")
 async def metrics():
